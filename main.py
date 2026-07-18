@@ -468,14 +468,20 @@ async def buscar_por_selfie(selfie: UploadFile = File(...), evento_id: Optional[
 
     face_ids = [m["Face"]["FaceId"] for m in matches]
 
-    # Buscar fotos que contienen esos face_ids
+    # Buscar fotos que contienen esos face_ids usando SQL directo
+    import json
     fotos_encontradas = []
     for fid in face_ids:
-        result = supabase.table("fotos").select("id, url_preview, dorsal, evento_id, tiene_rostros").contains("face_ids", [fid])
-        if evento_id:
-            result = result.eq("evento_id", evento_id)
-        data = result.execute().data or []
-        fotos_encontradas.extend(data)
+        try:
+            query = supabase.table("fotos").select("id, url_preview, dorsal, evento_id, tiene_rostros")
+            # Usar filter con operador cs (contains) para jsonb array
+            query = query.filter("face_ids", "cs", json.dumps([fid]))
+            if evento_id:
+                query = query.eq("evento_id", evento_id)
+            data = query.execute().data or []
+            fotos_encontradas.extend(data)
+        except Exception as e:
+            print(f"Error buscando face_id {fid}: {e}")
 
     # Deduplicar
     seen = set()
