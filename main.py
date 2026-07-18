@@ -700,3 +700,69 @@ def ver_progreso(evento_id: str):
         "porcentaje": porcentaje,
         "listo": porcentaje == 100
     }
+
+
+# ─── REPROCESAR FOTOS PENDIENTES ─────────────────────────────────────────────
+
+@app.post("/api/reprocesar/{evento_id}")
+async def reprocesar_fotos(evento_id: str, background_tasks: BackgroundTasks, fotografo=Depends(get_fotografo)):
+    ev = supabase.table("eventos").select("*").eq("id", evento_id).eq("fotografo_id", fotografo["id"]).execute()
+    if not ev.data:
+        return JSONResponse(status_code=403, content={"error": "Evento no encontrado"})
+    evento = ev.data[0]
+    fotos = supabase.table("fotos").select("*").eq("evento_id", evento_id).eq("procesada", False).execute()
+    pendientes = fotos.data or []
+    if not pendientes:
+        return {"mensaje": "No hay fotos pendientes", "total": 0}
+    for foto in pendientes:
+        background_tasks.add_task(
+            procesar_foto_inline, foto["id"], foto["url_original"], foto["nombre_archivo"],
+            evento_id, fotografo["id"], evento.get("modo_busqueda", "facial_dorsal"),
+            fotografo.get("marca_agua_url")
+        )
+    return {"mensaje": f"Reprocesando {len(pendientes)} fotos", "total": len(pendientes)}
+
+
+# ─── SUBIDA DIRECTA AL BACKEND ────────────────────────────────────────────────
+
+@app.post("/api/subir-foto")
+async def subir_foto_directo(
+    background_tasks: BackgroundTasks,
+    foto: UploadFile = File(...),
+    evento_id: str = Form(...),
+    album_id: Optional[str] = Form(None),
+    fotografo=Depends(get_fotografo)
+):
+    creditos = fotografo.get("creditos_disponibles") or 0
+    if creditos < 1:
+        return JSONResponse(status_code=400, content={"error": "Créditos insuficientes"})
+    ev = supabase.table("eventos").select("*").eq("id", evento_id).eq("fotografo_id", fotografo["id"]).execute()
+    if not ev.data:
+        return JSONResponse(status_code=403, content={"error": "Evento no encontrado"})
+    evento = ev.data[0]
+    foto_id = str(uuid.uuid4())
+    ext = foto.filename.rsplit(".", 1)[-1].lower() if "." in foto.filename else "jpg"
+    path = f"{fotografo['id']}/{evento_id}/{foto_id}.{ext}"
+    contenido = await foto.read()
+    supabase.storage.from_("fotos-originales").upload(path, contenido, {"content-type": foto.content_type or "image/jpeg"})
+    foto_data = {
+        "id": foto_id, "evento_id": evento_id, "fotografo_id": fotografo["id"],
+        "url_original": path, "nombre_archivo": foto.filename,
+        "tamano_bytes": len(contenido), "procesada": False,
+        "tiene_rostros": False, "cantidad_rostros": 0, "face_ids": [],
+    }
+    if album_id:
+        foto_data["album_id"] = album_id
+    supabase.table("fotos").insert(foto_data).execute()
+    supabase.table("fotografos").update({"creditos_disponibles": creditos - 1}).eq("id", fotografo["id"]).execute()
+    supabase.table("transacciones_creditos").insert({
+        "fotografo_id": fotografo["id"], "tipo": "consumo", "cantidad": -1,
+        "saldo_despues": creditos - 1, "descripcion": f"Foto: {foto.filename}"
+    }).execute()
+    supabase.table("eventos").update({"total_fotos": (evento.get("total_fotos") or 0) + 1}).eq("id", evento_id).execute()
+    background_tasks.add_task(
+        procesar_foto_inline, foto_id, path, foto.filename,
+        evento_id, fotografo["id"], evento.get("modo_busqueda", "facial_dorsal"),
+        fotografo.get("marca_agua_url")
+    )
+    return {"foto_id": foto_id, "estado": "procesando", "creditos_restantes": creditos - 1}
