@@ -1,0 +1,702 @@
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from botocore.config import Config
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from dotenv import load_dotenv
+from datetime import datetime
+import boto3
+import json
+import httpx
+import os
+import uuid
+import zipfile
+from supabase import create_client
+
+load_dotenv()
+
+app = FastAPI(title="Kusipix API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── CLIENTES AWS ─────────────────────────────────────────────────────────────
+
+rekognition = boto3.client(
+    "rekognition",
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION", "us-east-1")
+)
+
+sqs = boto3.client(
+    "sqs",
+    region_name=os.getenv("AWS_REGION", "us-east-1"),
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+)
+
+SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL", "")
+
+# ─── SUPABASE (service role para operaciones admin) ───────────────────────────
+
+supabase = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_SERVICE_KEY")  # service role key para bypass RLS
+)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+BACKEND_URL = os.getenv("BACKEND_URL", "https://api.kusipix.com")
+REKOGNITION_COLLECTION = os.getenv("REKOGNITION_COLLECTION", "kusipix-faces")
+
+# ─── AUTH: Verificar token JWT de Supabase ────────────────────────────────────
+
+async def get_current_user(authorization: str = Header(None)):
+    """Extrae el usuario autenticado del token Bearer de Supabase"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="No autorizado")
+    token = authorization.replace("Bearer ", "")
+    try:
+        # Verificar token con Supabase
+        user_client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+        user_client.auth._session = None
+        # Usar el token para obtener el usuario
+        resp = httpx.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY}
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Token inválido")
+        user_data = resp.json()
+        return user_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Error de autenticación: {str(e)}")
+
+async def get_fotografo(user=Depends(get_current_user)):
+    """Obtiene el perfil del fotógrafo a partir del usuario autenticado"""
+    result = supabase.table("fotografos").select("*").eq("auth_user_id", user["id"]).single().execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Perfil de fotógrafo no encontrado")
+    return result.data
+
+# ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+
+@app.get("/")
+def health():
+    return {"status": "ok", "platform": "Kusipix", "version": "1.0.0"}
+
+# ─── SUBIDA DE FOTOS (Presigned URL → Supabase Storage) ──────────────────────
+
+class GenerarUrlSubidaRequest(BaseModel):
+    filename: str
+    content_type: str
+    evento_id: str
+
+@app.post("/api/generar-url-subida")
+async def generar_url_subida(body: GenerarUrlSubidaRequest, fotografo=Depends(get_fotografo)):
+    """Genera URL presignada para subir foto original a Supabase Storage"""
+    ext = body.filename.rsplit(".", 1)[-1].lower()
+    foto_id = str(uuid.uuid4())
+    path = f"{fotografo['id']}/{body.evento_id}/{foto_id}.{ext}"
+
+    # Verificar créditos
+    if (fotografo.get("creditos_disponibles") or 0) < 1:
+        return JSONResponse(status_code=400, content={"error": "Créditos insuficientes"})
+
+    # Verificar que el evento pertenece al fotógrafo
+    ev = supabase.table("eventos").select("id").eq("id", body.evento_id).eq("fotografo_id", fotografo["id"]).execute()
+    if not ev.data:
+        return JSONResponse(status_code=403, content={"error": "Evento no encontrado"})
+
+    # Generar URL presignada para Supabase Storage
+    result = supabase.storage.from_("fotos-originales").create_signed_upload_url(path)
+
+    return {
+        "upload_url": result.get("signedUrl") or result.get("signed_url"),
+        "path": path,
+        "foto_id": foto_id,
+        "token": result.get("token"),
+    }
+
+class ConfirmarSubidaRequest(BaseModel):
+    path: str
+    filename: str
+    evento_id: str
+    foto_id: str
+    tamano_bytes: Optional[int] = None
+    album_id: Optional[str] = None
+
+@app.post("/api/confirmar-subida")
+async def confirmar_subida(body: ConfirmarSubidaRequest, background_tasks: BackgroundTasks, fotografo=Depends(get_fotografo)):
+    """Confirma la subida y encola el procesamiento"""
+    # Verificar créditos de nuevo
+    creditos = fotografo.get("creditos_disponibles") or 0
+    if creditos < 1:
+        return JSONResponse(status_code=400, content={"error": "Créditos insuficientes"})
+
+    # Verificar evento
+    ev = supabase.table("eventos").select("*").eq("id", body.evento_id).eq("fotografo_id", fotografo["id"]).execute()
+    if not ev.data:
+        return JSONResponse(status_code=403, content={"error": "Evento no encontrado"})
+    evento = ev.data[0]
+
+    # Insertar foto en DB
+    foto_data = {
+        "id": body.foto_id,
+        "evento_id": body.evento_id,
+        "fotografo_id": fotografo["id"],
+        "url_original": body.path,
+        "nombre_archivo": body.filename,
+        "tamano_bytes": body.tamano_bytes,
+        "procesada": False,
+        "tiene_rostros": False,
+        "cantidad_rostros": 0,
+        "face_ids": [],
+    }
+    if body.album_id:
+        foto_data["album_id"] = body.album_id
+
+    supabase.table("fotos").insert(foto_data).execute()
+
+    # Descontar crédito
+    supabase.table("fotografos").update({
+        "creditos_disponibles": creditos - 1
+    }).eq("id", fotografo["id"]).execute()
+
+    supabase.table("transacciones_creditos").insert({
+        "fotografo_id": fotografo["id"],
+        "tipo": "consumo",
+        "cantidad": -1,
+        "saldo_despues": creditos - 1,
+        "descripcion": f"Foto: {body.filename}"
+    }).execute()
+
+    # Actualizar contador del evento
+    supabase.table("eventos").update({
+        "total_fotos": (evento.get("total_fotos") or 0) + 1
+    }).eq("id", body.evento_id).execute()
+
+    # Encolar procesamiento (marca de agua + reconocimiento facial)
+    if SQS_QUEUE_URL:
+        try:
+            sqs.send_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MessageBody=json.dumps({
+                    "foto_id": body.foto_id,
+                    "path": body.path,
+                    "filename": body.filename,
+                    "evento_id": body.evento_id,
+                    "fotografo_id": fotografo["id"],
+                    "modo_busqueda": evento.get("modo_busqueda", "facial_dorsal"),
+                    "marca_agua_url": fotografo.get("marca_agua_url"),
+                    "usar_marca_plataforma": not fotografo.get("marca_agua_url"),
+                })
+            )
+        except Exception as e:
+            print(f"SQS error: {e}")
+            # Procesar en background si SQS falla
+            background_tasks.add_task(procesar_foto_inline, body.foto_id, body.path, body.filename, body.evento_id, fotografo["id"], evento.get("modo_busqueda"), fotografo.get("marca_agua_url"))
+
+    return {"foto_id": body.foto_id, "estado": "en_cola", "creditos_restantes": creditos - 1}
+
+class ConfirmarSubidaLoteRequest(BaseModel):
+    fotos: List[Dict[str, Any]]
+    evento_id: str
+
+@app.post("/api/confirmar-subida-lote")
+async def confirmar_subida_lote(body: ConfirmarSubidaLoteRequest, fotografo=Depends(get_fotografo)):
+    """Confirma subida en lote y encola procesamiento"""
+    creditos = fotografo.get("creditos_disponibles") or 0
+    n = len(body.fotos)
+
+    if creditos < n:
+        return JSONResponse(status_code=400, content={
+            "error": f"Créditos insuficientes. Tienes {creditos}, necesitas {n}."
+        })
+
+    ev = supabase.table("eventos").select("*").eq("id", body.evento_id).eq("fotografo_id", fotografo["id"]).execute()
+    if not ev.data:
+        return JSONResponse(status_code=403, content={"error": "Evento no encontrado"})
+    evento = ev.data[0]
+
+    # Insert en lote
+    filas = []
+    for f in body.fotos:
+        fila = {
+            "id": f.get("foto_id", str(uuid.uuid4())),
+            "evento_id": body.evento_id,
+            "fotografo_id": fotografo["id"],
+            "url_original": f["path"],
+            "nombre_archivo": f["filename"],
+            "tamano_bytes": f.get("tamano_bytes"),
+            "procesada": False,
+            "tiene_rostros": False,
+            "cantidad_rostros": 0,
+            "face_ids": [],
+        }
+        if f.get("album_id"):
+            fila["album_id"] = f["album_id"]
+        filas.append(fila)
+
+    resultado = supabase.table("fotos").insert(filas).execute()
+    insertadas = resultado.data or []
+
+    # Descontar créditos
+    nuevo_saldo = creditos - len(insertadas)
+    supabase.table("fotografos").update({
+        "creditos_disponibles": nuevo_saldo
+    }).eq("id", fotografo["id"]).execute()
+
+    supabase.table("transacciones_creditos").insert({
+        "fotografo_id": fotografo["id"],
+        "tipo": "consumo",
+        "cantidad": -len(insertadas),
+        "saldo_despues": nuevo_saldo,
+        "descripcion": f"Lote: {len(insertadas)} fotos - {evento.get('nombre', '')}"
+    }).execute()
+
+    # Actualizar contador
+    supabase.table("eventos").update({
+        "total_fotos": (evento.get("total_fotos") or 0) + len(insertadas)
+    }).eq("id", body.evento_id).execute()
+
+    # Encolar en SQS por lotes de 10
+    if SQS_QUEUE_URL:
+        mensajes = []
+        for i, fila in enumerate(insertadas):
+            original = body.fotos[i] if i < len(body.fotos) else {}
+            mensajes.append({
+                "Id": str(i),
+                "MessageBody": json.dumps({
+                    "foto_id": fila["id"],
+                    "path": fila["url_original"],
+                    "filename": fila["nombre_archivo"],
+                    "evento_id": body.evento_id,
+                    "fotografo_id": fotografo["id"],
+                    "modo_busqueda": evento.get("modo_busqueda", "facial_dorsal"),
+                    "marca_agua_url": fotografo.get("marca_agua_url"),
+                    "usar_marca_plataforma": not fotografo.get("marca_agua_url"),
+                })
+            })
+        enviados = 0
+        for i in range(0, len(mensajes), 10):
+            chunk = mensajes[i:i+10]
+            try:
+                sqs.send_message_batch(QueueUrl=SQS_QUEUE_URL, Entries=chunk)
+                enviados += len(chunk)
+            except Exception as e:
+                print(f"SQS batch error: {e}")
+
+    return {
+        "insertadas": len(insertadas),
+        "creditos_restantes": nuevo_saldo,
+    }
+
+# ─── CHEQUEO DE DUPLICADOS ────────────────────────────────────────────────────
+
+class ChequearDuplicadosRequest(BaseModel):
+    evento_id: str
+    archivos: List[Dict[str, Any]]
+
+@app.post("/api/chequear-duplicados")
+async def chequear_duplicados(body: ChequearDuplicadosRequest, fotografo=Depends(get_fotografo)):
+    """Verifica duplicados por nombre + tamaño"""
+    if not body.archivos:
+        return {"duplicados": {}}
+
+    nombres = list({a.get("nombre", "").strip() for a in body.archivos if a.get("nombre")})
+    if not nombres:
+        return {"duplicados": {}}
+
+    coincidencias = []
+    for i in range(0, len(nombres), 500):
+        chunk = nombres[i:i+500]
+        r = supabase.table("fotos").select("nombre_archivo, tamano_bytes").eq("evento_id", body.evento_id).in_("nombre_archivo", chunk).execute()
+        coincidencias.extend(r.data or [])
+
+    por_nombre = {}
+    for row in coincidencias:
+        n = (row.get("nombre_archivo") or "").strip()
+        t = row.get("tamano_bytes")
+        por_nombre.setdefault(n, []).append(t)
+
+    duplicados = {}
+    for a in body.archivos:
+        n = (a.get("nombre") or "").strip()
+        t = a.get("tamano")
+        if not n or n not in por_nombre:
+            continue
+        tamanos = por_nombre[n]
+        if t is not None and any(te == t for te in tamanos if te is not None):
+            duplicados[n] = {"tipo": "exacto"}
+        elif all(te is None for te in tamanos):
+            duplicados[n] = {"tipo": "solo_nombre"}
+
+    return {"duplicados": duplicados}
+
+# ─── PROCESAMIENTO DE FOTOS (inline, backup si SQS falla) ────────────────────
+
+async def procesar_foto_inline(foto_id, path, filename, evento_id, fotografo_id, modo_busqueda, marca_agua_url):
+    """Procesa foto sin SQS - genera preview con marca de agua y detecta caras/dorsales"""
+    try:
+        # Descargar foto original desde Supabase Storage
+        data = supabase.storage.from_("fotos-originales").download(path)
+        if not data:
+            return
+
+        # Generar preview con marca de agua usando Pillow
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+
+        img = Image.open(io.BytesIO(data))
+        draw = ImageDraw.Draw(img)
+
+        # Marca de agua de texto simple (se mejora con logo después)
+        w, h = img.size
+        texto = "© Kusipix"
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(24, w // 30))
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Marca de agua diagonal repetida
+        for y in range(0, h, h // 4):
+            for x in range(0, w, w // 3):
+                draw.text((x, y), texto, fill=(255, 255, 255, 80), font=font)
+
+        # Resize preview (max 1200px)
+        max_dim = 1200
+        if w > max_dim or h > max_dim:
+            ratio = min(max_dim / w, max_dim / h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+        # Guardar preview
+        preview_buf = io.BytesIO()
+        img.save(preview_buf, "JPEG", quality=85)
+        preview_buf.seek(0)
+
+        preview_path = f"{fotografo_id}/{evento_id}/{foto_id}_preview.jpg"
+        supabase.storage.from_("fotos-preview").upload(
+            preview_path,
+            preview_buf.getvalue(),
+            {"content-type": "image/jpeg"}
+        )
+
+        preview_url = f"{SUPABASE_URL}/storage/v1/object/public/fotos-preview/{preview_path}"
+
+        # Reconocimiento facial
+        face_ids = []
+        cantidad_rostros = 0
+        dorsales = []
+
+        if modo_busqueda in ("facial", "facial_dorsal"):
+            try:
+                resp = rekognition.index_faces(
+                    CollectionId=REKOGNITION_COLLECTION,
+                    Image={"Bytes": data},
+                    ExternalImageId=foto_id,
+                    DetectionAttributes=["DEFAULT"],
+                    MaxFaces=10,
+                )
+                for face in resp.get("FaceRecords", []):
+                    face_ids.append(face["Face"]["FaceId"])
+                cantidad_rostros = len(face_ids)
+            except Exception as e:
+                print(f"Rekognition IndexFaces error: {e}")
+
+        if modo_busqueda in ("dorsal", "facial_dorsal"):
+            try:
+                resp = rekognition.detect_text(Image={"Bytes": data})
+                for det in resp.get("TextDetections", []):
+                    if det["Type"] == "LINE":
+                        texto_det = det["DetectedText"].strip()
+                        if texto_det.isdigit() and 1 <= len(texto_det) <= 5:
+                            dorsales.append(texto_det)
+            except Exception as e:
+                print(f"Rekognition DetectText error: {e}")
+
+        # Actualizar foto en DB
+        update_data = {
+            "url_preview": preview_url,
+            "procesada": True,
+            "tiene_rostros": cantidad_rostros > 0,
+            "cantidad_rostros": cantidad_rostros,
+            "face_ids": face_ids,
+            "ancho": w,
+            "alto": h,
+        }
+        if dorsales:
+            update_data["dorsal"] = dorsales[0]  # primer dorsal detectado
+
+        supabase.table("fotos").update(update_data).eq("id", foto_id).execute()
+
+    except Exception as e:
+        print(f"Error procesando foto {foto_id}: {e}")
+        supabase.table("fotos").update({"procesada": True}).eq("id", foto_id).execute()
+
+# ─── BÚSQUEDA PÚBLICA ────────────────────────────────────────────────────────
+
+@app.post("/api/buscar-por-selfie")
+async def buscar_por_selfie(selfie: UploadFile = File(...), evento_id: Optional[str] = None):
+    """Búsqueda por reconocimiento facial - público"""
+    contenido = await selfie.read()
+    try:
+        resultado = rekognition.search_faces_by_image(
+            CollectionId=REKOGNITION_COLLECTION,
+            Image={"Bytes": contenido},
+            MaxFaces=100,
+            FaceMatchThreshold=75
+        )
+    except Exception as e:
+        return {"mensaje": "No se pudo procesar la selfie", "fotos": []}
+
+    matches = resultado.get("FaceMatches", [])
+    if not matches:
+        return {"mensaje": "No se encontraron fotos", "fotos": []}
+
+    face_ids = [m["Face"]["FaceId"] for m in matches]
+
+    # Buscar fotos que contienen esos face_ids
+    fotos_encontradas = []
+    for fid in face_ids:
+        result = supabase.table("fotos").select("id, url_preview, dorsal, evento_id, tiene_rostros").contains("face_ids", [fid])
+        if evento_id:
+            result = result.eq("evento_id", evento_id)
+        data = result.execute().data or []
+        fotos_encontradas.extend(data)
+
+    # Deduplicar
+    seen = set()
+    fotos_unicas = []
+    for f in fotos_encontradas:
+        if f["id"] not in seen:
+            seen.add(f["id"])
+            fotos_unicas.append(f)
+
+    return {"mensaje": f"Se encontraron {len(fotos_unicas)} fotos", "fotos": fotos_unicas}
+
+@app.get("/api/buscar-por-dorsal")
+def buscar_por_dorsal(dorsal: str, evento_id: Optional[str] = None):
+    """Búsqueda por número de dorsal - público"""
+    query = supabase.table("fotos").select("id, url_preview, dorsal, evento_id").eq("dorsal", dorsal)
+    if evento_id:
+        query = query.eq("evento_id", evento_id)
+    resultado = query.execute()
+    return {"mensaje": f"Se encontraron {len(resultado.data)} fotos", "fotos": resultado.data}
+
+# ─── EVENTO PÚBLICO ──────────────────────────────────────────────────────────
+
+@app.get("/api/evento/{slug}")
+def evento_publico(slug: str):
+    """Info pública de un evento para la página de compra"""
+    ev = supabase.table("eventos").select("*").eq("slug", slug).eq("activo", True).eq("publico", True).execute()
+    if not ev.data:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+    evento = ev.data[0]
+
+    # Info del fotógrafo (nombre, logo, colores)
+    fot = supabase.table("fotografos").select("nombre, logo_url, color_primario, color_secundario, slug").eq("id", evento["fotografo_id"]).execute()
+    fotografo_info = fot.data[0] if fot.data else {}
+
+    return {
+        "evento": evento,
+        "fotografo": fotografo_info,
+    }
+
+@app.get("/api/evento/{slug}/fotos")
+def fotos_evento_publico(slug: str, dorsal: Optional[str] = None, album_id: Optional[str] = None, pagina: int = 0, por_pagina: int = 50):
+    """Lista fotos públicas de un evento (con marca de agua)"""
+    ev = supabase.table("eventos").select("id").eq("slug", slug).eq("activo", True).eq("publico", True).execute()
+    if not ev.data:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+
+    evento_id = ev.data[0]["id"]
+    desde = pagina * por_pagina
+
+    query = supabase.table("fotos").select("id, url_preview, dorsal, tiene_rostros, cantidad_rostros, created_at").eq("evento_id", evento_id).eq("procesada", True)
+    if dorsal:
+        query = query.eq("dorsal", dorsal)
+    if album_id:
+        query = query.eq("album_id", album_id)
+
+    resultado = query.order("created_at", desc=True).range(desde, desde + por_pagina - 1).execute()
+    total = supabase.table("fotos").select("id", count="exact").eq("evento_id", evento_id).eq("procesada", True).execute().count or 0
+
+    return {"fotos": resultado.data, "total": total, "pagina": pagina}
+
+# ─── PAGOS (Transbank por fotógrafo) ──────────────────────────────────────────
+
+class CrearPagoRequest(BaseModel):
+    evento_id: str
+    foto_ids: List[str]
+    nombre: Optional[str] = None
+    email: Optional[str] = None
+    telefono: Optional[str] = None
+
+@app.post("/api/pago/crear")
+def crear_pago(body: CrearPagoRequest):
+    """Crea transacción de pago usando credenciales Transbank del fotógrafo"""
+    from transbank.webpay.webpay_plus.transaction import Transaction
+    from transbank.common.options import WebpayOptions
+    from transbank.common.integration_commerce_codes import IntegrationCommerceCodes
+    from transbank.common.integration_api_keys import IntegrationApiKeys
+
+    ev = supabase.table("eventos").select("*").eq("id", body.evento_id).execute().data
+    if not ev:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+    evento = ev[0]
+
+    # Obtener credenciales Transbank del fotógrafo dueño del evento
+    fot = supabase.table("fotografos").select("transbank_codigo_comercio, transbank_api_key, transbank_shared_secret, transbank_ambiente").eq("id", evento["fotografo_id"]).execute()
+    if not fot.data:
+        return JSONResponse(status_code=400, content={"error": "Fotógrafo no configurado"})
+    creds = fot.data[0]
+
+    n = len(body.foto_ids)
+    if n == 0:
+        return JSONResponse(status_code=400, content={"error": "No hay fotos seleccionadas"})
+
+    monto = (evento.get("precio_foto") or 0) * n
+
+    buy_order = "KP" + uuid.uuid4().hex[:18]
+    session_id = uuid.uuid4().hex[:18]
+
+    # Registrar venta
+    supabase.table("ventas").insert({
+        "evento_id": body.evento_id,
+        "fotografo_id": evento["fotografo_id"],
+        "comprador_nombre": body.nombre,
+        "comprador_email": body.email,
+        "comprador_telefono": body.telefono,
+        "monto_total": monto,
+        "metodo_pago": "transbank",
+        "referencia_pago": buy_order,
+        "estado": "pendiente",
+        "tipo_compra": "individual" if n == 1 else "pack",
+        "cantidad_fotos": n,
+    }).execute()
+
+    # Crear transacción Transbank con credenciales del fotógrafo
+    if creds.get("transbank_ambiente") == "PRODUCTION" and creds.get("transbank_codigo_comercio"):
+        options = WebpayOptions(
+            creds["transbank_codigo_comercio"],
+            creds["transbank_api_key"],
+            "https://webpay3g.transbank.cl"
+        )
+    else:
+        options = WebpayOptions(
+            IntegrationCommerceCodes.WEBPAY_PLUS,
+            IntegrationApiKeys.WEBPAY,
+            "https://webpay3gint.transbank.cl"
+        )
+
+    tx = Transaction(options)
+    resp = tx.create(buy_order, session_id, monto, f"{BACKEND_URL}/api/pago/retorno")
+
+    supabase.table("ventas").update({"referencia_pago": resp["token"]}).eq("referencia_pago", buy_order).execute()
+
+    return {"url": resp["url"], "token": resp["token"], "buy_order": buy_order, "monto": monto}
+
+@app.get("/api/pago/retorno")
+@app.post("/api/pago/retorno")
+async def pago_retorno(token_ws: str = None):
+    """Retorno de Transbank después del pago"""
+    from transbank.webpay.webpay_plus.transaction import Transaction
+    from transbank.common.options import WebpayOptions
+    from transbank.common.integration_commerce_codes import IntegrationCommerceCodes
+    from transbank.common.integration_api_keys import IntegrationApiKeys
+
+    if not token_ws:
+        return RedirectResponse("https://kusipix.com?pago=rechazado", status_code=303)
+
+    # Buscar la venta por token
+    venta = supabase.table("ventas").select("*, eventos(slug, fotografo_id)").eq("referencia_pago", token_ws).execute().data
+    if not venta:
+        return RedirectResponse("https://kusipix.com?pago=error", status_code=303)
+    v = venta[0]
+
+    # Obtener credenciales del fotógrafo
+    fot_id = v.get("fotografo_id")
+    creds = supabase.table("fotografos").select("transbank_codigo_comercio, transbank_api_key, transbank_ambiente, slug").eq("id", fot_id).execute().data
+    cred = creds[0] if creds else {}
+
+    if cred.get("transbank_ambiente") == "PRODUCTION" and cred.get("transbank_codigo_comercio"):
+        options = WebpayOptions(cred["transbank_codigo_comercio"], cred["transbank_api_key"], "https://webpay3g.transbank.cl")
+    else:
+        options = WebpayOptions(IntegrationCommerceCodes.WEBPAY_PLUS, IntegrationApiKeys.WEBPAY, "https://webpay3gint.transbank.cl")
+
+    tx = Transaction(options)
+    try:
+        result = tx.commit(token_ws)
+        aprobado = result.get("response_code") == 0
+    except Exception:
+        aprobado = False
+
+    if aprobado:
+        supabase.table("ventas").update({
+            "estado": "completado",
+        }).eq("referencia_pago", token_ws).execute()
+
+        # Actualizar contadores del evento
+        supabase.table("eventos").update({
+            "total_ventas": (supabase.table("eventos").select("total_ventas").eq("id", v["evento_id"]).execute().data[0].get("total_ventas") or 0) + 1,
+            "monto_total_ventas": (supabase.table("eventos").select("monto_total_ventas").eq("id", v["evento_id"]).execute().data[0].get("monto_total_ventas") or 0) + v["monto_total"],
+        }).eq("id", v["evento_id"]).execute()
+
+    estado = "ok" if aprobado else "rechazado"
+    slug_evento = v.get("eventos", {}).get("slug", "")
+    return RedirectResponse(f"https://kusipix.com/evento/{slug_evento}?pago={estado}&orden={v.get('referencia_pago')}", status_code=303)
+
+# ─── DESCARGA DE FOTOS COMPRADAS ─────────────────────────────────────────────
+
+@app.get("/api/descargas/{token}")
+def descargar_fotos(token: str):
+    """Genera URLs de descarga para fotos compradas"""
+    v = supabase.table("ventas").select("*").eq("token_descarga", token).eq("estado", "completado").execute()
+    if not v.data:
+        return JSONResponse(status_code=404, content={"error": "Compra no encontrada"})
+    venta = v.data[0]
+
+    # Obtener las fotos de la venta
+    vf = supabase.table("venta_fotos").select("foto_id").eq("venta_id", venta["id"]).execute()
+    foto_ids = [f["foto_id"] for f in (vf.data or [])]
+
+    if not foto_ids:
+        return {"fotos": []}
+
+    fotos = supabase.table("fotos").select("id, url_original, nombre_archivo").in_("id", foto_ids).execute()
+    resultado = []
+    for f in (fotos.data or []):
+        # Generar URL temporal de descarga
+        url = supabase.storage.from_("fotos-originales").create_signed_url(f["url_original"], 3600)
+        resultado.append({
+            "id": f["id"],
+            "nombre": f.get("nombre_archivo", f["id"] + ".jpg"),
+            "url": url.get("signedUrl") or url.get("signed_url"),
+        })
+
+    return {"fotos": resultado}
+
+# ─── PROGRESO DE PROCESAMIENTO ───────────────────────────────────────────────
+
+@app.get("/api/progreso/{evento_id}")
+def ver_progreso(evento_id: str):
+    """Estado de procesamiento de fotos de un evento"""
+    total = supabase.table("fotos").select("id", count="exact").eq("evento_id", evento_id).execute().count or 0
+    procesadas = supabase.table("fotos").select("id", count="exact").eq("evento_id", evento_id).eq("procesada", True).execute().count or 0
+    porcentaje = round((procesadas / total * 100) if total > 0 else 0)
+    return {
+        "total": total,
+        "procesadas": procesadas,
+        "pendientes": total - procesadas,
+        "porcentaje": porcentaje,
+        "listo": porcentaje == 100
+    }
