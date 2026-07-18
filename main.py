@@ -384,11 +384,15 @@ async def procesar_foto_inline(foto_id, path, filename, evento_id, fotografo_id,
         preview_buf.seek(0)
 
         preview_path = f"{fotografo_id}/{evento_id}/{foto_id}_preview.jpg"
-        supabase.storage.from_("fotos-preview").upload(
-            preview_path,
-            preview_buf.getvalue(),
-            {"content-type": "image/jpeg"}
-        )
+        try:
+            supabase.storage.from_("fotos-preview").upload(
+                preview_path, preview_buf.getvalue(), {"content-type": "image/jpeg"}
+            )
+        except Exception:
+            # Si ya existe, sobreescribir
+            supabase.storage.from_("fotos-preview").update(
+                preview_path, preview_buf.getvalue(), {"content-type": "image/jpeg"}
+            )
 
         preview_url = f"{SUPABASE_URL}/storage/v1/object/public/fotos-preview/{preview_path}"
 
