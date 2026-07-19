@@ -702,25 +702,35 @@ def descargar_fotos(token: str):
         return JSONResponse(status_code=404, content={"error": "Compra no encontrada"})
     venta = v.data[0]
 
-    # Obtener las fotos de la venta
-    vf = supabase.table("venta_fotos").select("foto_id").eq("venta_id", venta["id"]).execute()
+    # Obtener exactamente las fotos de esta venta
+    vf = supabase.table("venta_fotos").select("foto_id, precio").eq("venta_id", venta["id"]).execute()
     foto_ids = [f["foto_id"] for f in (vf.data or [])]
 
     if not foto_ids:
-        return {"fotos": []}
+        return JSONResponse(status_code=404, content={"error": "No hay fotos en esta compra"})
 
-    fotos = supabase.table("fotos").select("id, url_original, nombre_archivo").in_("id", foto_ids).execute()
+    fotos = supabase.table("fotos").select("id, url_original, url_preview, nombre_archivo").in_("id", foto_ids).execute()
     resultado = []
     for f in (fotos.data or []):
-        # Generar URL temporal de descarga
-        url = supabase.storage.from_("fotos-originales").create_signed_url(f["url_original"], 3600)
+        try:
+            # Signed URL para descarga de la foto original (sin marca de agua)
+            signed = supabase.storage.from_("fotos-originales").create_signed_url(f["url_original"], 3600)
+            download_url = signed.get("signedURL") or signed.get("signedUrl") or signed.get("signed_url") or ""
+        except Exception as e:
+            print(f"Error signed URL: {e}")
+            download_url = ""
+
+        # Preview URL para miniatura (pública)
+        preview_url = f.get("url_preview") or ""
+
         resultado.append({
             "id": f["id"],
             "nombre": f.get("nombre_archivo", f["id"] + ".jpg"),
-            "url": url.get("signedUrl") or url.get("signed_url"),
+            "url": download_url,
+            "preview": preview_url,
         })
 
-    return {"fotos": resultado}
+    return {"fotos": resultado, "total": len(resultado)}
 
 # ─── PROGRESO DE PROCESAMIENTO ───────────────────────────────────────────────
 
