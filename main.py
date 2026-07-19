@@ -662,8 +662,26 @@ async def pago_retorno(token_ws: str = None):
         }).eq("id", v["evento_id"]).execute()
 
     estado = "ok" if aprobado else "rechazado"
-    slug_evento = v.get("eventos", {}).get("slug", "")
-    return RedirectResponse(f"https://kusipix.com/evento/{slug_evento}?pago={estado}&orden={v.get('referencia_pago')}", status_code=303)
+    slug_evento = v.get("eventos", {}).get("slug", "") if isinstance(v.get("eventos"), dict) else ""
+    token_descarga = v.get("token_descarga", "")
+
+    if aprobado and v.get("comprador_email"):
+        try:
+            resend_key = os.getenv("RESEND_API_KEY", "")
+            if resend_key:
+                nombre = v.get("comprador_nombre") or "Cliente"
+                descarga_url = f"https://kusipix.com/descargas/{token_descarga}"
+                import httpx as hx
+                hx.post("https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {resend_key}"},
+                    json={"from": "Kusipix <noreply@kusipix.com>", "to": [v["comprador_email"]],
+                          "subject": "Tus fotos de Kusipix estan listas",
+                          "html": f"<p>Hola {nombre}, tu pago fue exitoso. <a href=\"{descarga_url}\">Descarga tus fotos aqui</a></p>"},
+                    timeout=10)
+        except Exception as e:
+            print(f"Error email: {e}")
+
+    return RedirectResponse(f"https://kusipix.com/evento/{slug_evento}?pago={estado}&token={token_descarga}", status_code=303)
 
 # ─── DESCARGA DE FOTOS COMPRADAS ─────────────────────────────────────────────
 
