@@ -726,11 +726,55 @@ def descargar_fotos(token: str):
         resultado.append({
             "id": f["id"],
             "nombre": f.get("nombre_archivo", f["id"] + ".jpg"),
-            "url": download_url,
+            "url": f"{BACKEND_URL}/api/descargar/{token}/{f['id']}",
             "preview": preview_url,
         })
 
     return {"fotos": resultado, "total": len(resultado)}
+
+# ─── DESCARGA PROXY (fuerza descarga en navegador) ───────────────────────────
+
+@app.get("/api/descargar/{token}/{foto_id}")
+async def descargar_foto_proxy(token: str, foto_id: str):
+    """Proxy de descarga - fuerza descarga del archivo en el navegador"""
+    # Verificar que la compra es válida
+    v = supabase.table("ventas").select("id").eq("token_descarga", token).eq("estado", "completado").execute()
+    if not v.data:
+        return JSONResponse(status_code=404, content={"error": "Compra no encontrada"})
+
+    venta_id = v.data[0]["id"]
+
+    # Verificar que la foto pertenece a esta venta
+    vf = supabase.table("venta_fotos").select("foto_id").eq("venta_id", venta_id).eq("foto_id", foto_id).execute()
+    if not vf.data:
+        return JSONResponse(status_code=403, content={"error": "Foto no pertenece a esta compra"})
+
+    # Obtener la foto
+    foto = supabase.table("fotos").select("url_original, nombre_archivo").eq("id", foto_id).execute()
+    if not foto.data:
+        return JSONResponse(status_code=404, content={"error": "Foto no encontrada"})
+
+    f = foto.data[0]
+    nombre = f.get("nombre_archivo", foto_id + ".jpg")
+
+    # Descargar desde Supabase Storage
+    try:
+        data = supabase.storage.from_("fotos-originales").download(f["url_original"])
+        ext = nombre.rsplit(".", 1)[-1].lower() if "." in nombre else "jpg"
+        content_types = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+        ct = content_types.get(ext, "image/jpeg")
+
+        return StreamingResponse(
+            iter([data]),
+            media_type=ct,
+            headers={
+                "Content-Disposition": f'attachment; filename="{nombre}"',
+                "Content-Length": str(len(data))
+            }
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Error descargando: {str(e)}"})
+
 
 # ─── PROGRESO DE PROCESAMIENTO ───────────────────────────────────────────────
 
