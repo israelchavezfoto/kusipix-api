@@ -580,7 +580,7 @@ def crear_pago(body: CrearPagoRequest):
     session_id = uuid.uuid4().hex[:18]
 
     # Registrar venta
-    supabase.table("ventas").insert({
+    venta_result = supabase.table("ventas").insert({
         "evento_id": body.evento_id,
         "fotografo_id": evento["fotografo_id"],
         "comprador_nombre": body.nombre,
@@ -593,6 +593,15 @@ def crear_pago(body: CrearPagoRequest):
         "tipo_compra": "individual" if n == 1 else "pack",
         "cantidad_fotos": n,
     }).execute()
+
+    # Guardar fotos en venta_fotos
+    if venta_result.data and body.foto_ids:
+        venta_id = venta_result.data[0]["id"]
+        precio_por_foto = evento.get("precio_foto") or 0
+        supabase.table("venta_fotos").insert([
+            {"venta_id": venta_id, "foto_id": fid, "precio": precio_por_foto}
+            for fid in body.foto_ids
+        ]).execute()
 
     # Crear transacción Transbank con credenciales del fotógrafo
     if creds.get("transbank_ambiente") == "PRODUCTION" and creds.get("transbank_codigo_comercio"):
