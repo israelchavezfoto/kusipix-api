@@ -598,6 +598,9 @@ async def pago_flow_retorno(token: str = None):
             except Exception as e:
                 print(f"Error email Flow: {e}")
 
+        # Notificar al fotografo
+        await notificar_venta_fotografo(v, v["evento_id"], fot_id)
+
     estado = "ok" if aprobado else "rechazado"
     return RedirectResponse(f"https://kusipix.com/evento/{slug_evento}?pago={estado}&token={token_descarga}", status_code=303)
 
@@ -697,6 +700,76 @@ def fotos_evento_publico(slug: str, dorsal: Optional[str] = None, album_id: Opti
     total = supabase.table("fotos").select("id", count="exact").eq("evento_id", evento_id).eq("procesada", True).execute().count or 0
 
     return {"fotos": resultado.data, "total": total, "pagina": pagina}
+
+# ─── HELPER: Notificar fotógrafo por venta ───────────────────────────────────
+
+async def notificar_venta_fotografo(venta: dict, evento_id: str, fotografo_id: str):
+    """Envía email al fotógrafo avisando de una nueva venta"""
+    try:
+        resend_key = os.getenv("RESEND_API_KEY", "")
+        if not resend_key:
+            return
+
+        fot_data = supabase.table("fotografos").select("email, nombre").eq("id", fotografo_id).execute().data
+        if not fot_data:
+            return
+        fot = fot_data[0]
+
+        ev_data = supabase.table("eventos").select("nombre").eq("id", evento_id).execute().data
+        ev_nombre = ev_data[0]["nombre"] if ev_data else "tu evento"
+
+        monto = int(venta.get("monto_total", 0))
+        monto_fmt = f"${monto:,}".replace(",", ".")
+        cantidad = venta.get("cantidad_fotos", 1)
+        comprador = venta.get("comprador_email", "—")
+        nombre_fot = fot.get("nombre", "Fotógrafo")
+
+        httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {resend_key}"},
+            json={
+                "from": "Kusipix <noreply@kusipix.com>",
+                "to": [fot["email"]],
+                "subject": f"💰 Nueva venta — {monto_fmt} CLP en {ev_nombre}",
+                "html": f"""<div style="font-family:sans-serif;max-width:580px;margin:0 auto;background:#0f1117;color:#e2e8f0;border-radius:16px;overflow:hidden">
+                    <div style="background:linear-gradient(135deg,#7c5cf0,#3b82f6);padding:32px;text-align:center">
+                        <div style="font-size:48px;margin-bottom:8px">💰</div>
+                        <h2 style="color:white;margin:0;font-size:22px">Nueva venta</h2>
+                    </div>
+                    <div style="padding:28px">
+                        <p style="font-size:15px;color:#8892a4;margin:0 0 20px">Hola {nombre_fot},</p>
+                        <div style="background:#1a1d27;border-radius:12px;padding:20px;margin-bottom:20px;border:1px solid #2a2d3a">
+                            <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+                                <span style="color:#8892a4;font-size:14px">Evento</span>
+                                <span style="color:#e2e8f0;font-weight:500">{ev_nombre}</span>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+                                <span style="color:#8892a4;font-size:14px">Comprador</span>
+                                <span style="color:#e2e8f0">{comprador}</span>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;margin-bottom:12px">
+                                <span style="color:#8892a4;font-size:14px">Fotos vendidas</span>
+                                <span style="color:#e2e8f0">{cantidad}</span>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;border-top:1px solid #2a2d3a;padding-top:14px;margin-top:4px">
+                                <span style="color:#8892a4;font-size:14px;font-weight:500">Total</span>
+                                <span style="color:#7c5cf0;font-weight:700;font-size:22px">{monto_fmt} CLP</span>
+                            </div>
+                        </div>
+                        <div style="text-align:center">
+                            <a href="https://kusipix.com/panel" style="display:inline-block;background:#7c5cf0;color:white;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600">Ver mis ventas</a>
+                        </div>
+                    </div>
+                    <div style="background:#13151e;padding:16px 28px;text-align:center;border-top:1px solid #2a2d3a">
+                        <p style="font-size:12px;color:#64748b;margin:0">Kusipix · kusipix.com</p>
+                    </div>
+                </div>"""
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print(f"Error notificando fotografo: {e}")
+
 
 # ─── PAGOS (Transbank por fotógrafo) ──────────────────────────────────────────
 
@@ -829,6 +902,9 @@ async def pago_retorno(token_ws: str = None):
     estado = "ok" if aprobado else "rechazado"
     slug_evento = v.get("eventos", {}).get("slug", "") if isinstance(v.get("eventos"), dict) else ""
     token_descarga = v.get("token_descarga", "")
+
+    if aprobado:
+        await notificar_venta_fotografo(v, v["evento_id"], fot_id)
 
     if aprobado and v.get("comprador_email"):
         try:
