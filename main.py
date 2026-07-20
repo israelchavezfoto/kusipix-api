@@ -442,6 +442,48 @@ async def procesar_foto_inline(foto_id, path, filename, evento_id, fotografo_id,
 
         supabase.table("fotos").update(update_data).eq("id", foto_id).execute()
 
+        # Verificar si es la última foto pendiente del evento
+        try:
+            pendientes = supabase.table("fotos").select("id", count="exact").eq("evento_id", evento_id).eq("procesada", False).execute()
+            if (pendientes.count or 0) == 0:
+                # Todas procesadas — notificar al fotógrafo si tiene esa preferencia
+                fot_pref = supabase.table("fotografos").select("email, nombre, notif_procesamiento").eq("id", fotografo_id).execute().data
+                if fot_pref and fot_pref[0].get("notif_procesamiento") is not False:
+                    fot = fot_pref[0]
+                    ev = supabase.table("eventos").select("nombre, total_fotos").eq("id", evento_id).execute().data
+                    ev_nombre = ev[0]["nombre"] if ev else "tu evento"
+                    total = ev[0].get("total_fotos", 0) if ev else 0
+                    resend_key = os.getenv("RESEND_API_KEY", "")
+                    if resend_key:
+                        import httpx as hx2
+                        hx2.post("https://api.resend.com/emails",
+                            headers={"Authorization": f"Bearer {resend_key}"},
+                            json={
+                                "from": "Kusipix <noreply@kusipix.com>",
+                                "to": [fot["email"]],
+                                "subject": f"✅ Fotos de {ev_nombre} listas para el público",
+                                "html": f'''<div style="font-family:sans-serif;max-width:580px;margin:0 auto;background:#0f1117;color:#e2e8f0;border-radius:16px;overflow:hidden">
+                                    <div style="background:linear-gradient(135deg,#22c55e,#3b82f6);padding:32px;text-align:center">
+                                        <div style="font-size:48px;margin-bottom:8px">✅</div>
+                                        <h2 style="color:white;margin:0;font-size:22px">Fotos procesadas</h2>
+                                    </div>
+                                    <div style="padding:28px">
+                                        <p style="font-size:15px;color:#8892a4;margin:0 0 16px">Hola {fot["nombre"]},</p>
+                                        <p style="font-size:15px;color:#e2e8f0;margin:0 0 20px">Las <strong>{total} fotos</strong> de <strong>{ev_nombre}</strong> ya están procesadas y disponibles para tus clientes.</p>
+                                        <div style="text-align:center">
+                                            <a href="https://kusipix.com/panel" style="display:inline-block;background:#22c55e;color:white;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600">Ver mi evento</a>
+                                        </div>
+                                    </div>
+                                    <div style="background:#13151e;padding:16px 28px;text-align:center;border-top:1px solid #2a2d3a">
+                                        <p style="font-size:12px;color:#64748b;margin:0">Kusipix · kusipix.com</p>
+                                    </div>
+                                </div>'''
+                            },
+                            timeout=10
+                        )
+        except Exception as notif_err:
+            print(f"Error notif procesamiento: {notif_err}")
+
     except Exception as e:
         print(f"Error procesando foto {foto_id}: {e}")
         supabase.table("fotos").update({"procesada": True}).eq("id", foto_id).execute()
@@ -710,10 +752,14 @@ async def notificar_venta_fotografo(venta: dict, evento_id: str, fotografo_id: s
         if not resend_key:
             return
 
-        fot_data = supabase.table("fotografos").select("email, nombre").eq("id", fotografo_id).execute().data
+        fot_data = supabase.table("fotografos").select("email, nombre, notif_ventas").eq("id", fotografo_id).execute().data
         if not fot_data:
             return
         fot = fot_data[0]
+
+        # Respetar preferencia de notificaciones
+        if fot.get("notif_ventas") is False:
+            return
 
         ev_data = supabase.table("eventos").select("nombre").eq("id", evento_id).execute().data
         ev_nombre = ev_data[0]["nombre"] if ev_data else "tu evento"
