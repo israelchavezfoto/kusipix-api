@@ -8,3 +8,4 @@ transbank-sdk==4.0.0
 Pillow==10.4.0
 python-multipart==0.0.9
 pydantic==2.8.0
+pyflowcl==2026.5.0

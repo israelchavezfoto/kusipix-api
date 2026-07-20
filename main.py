@@ -446,6 +446,162 @@ async def procesar_foto_inline(foto_id, path, filename, evento_id, fotografo_id,
         print(f"Error procesando foto {foto_id}: {e}")
         supabase.table("fotos").update({"procesada": True}).eq("id", foto_id).execute()
 
+# ─── PAGO CON FLOW ───────────────────────────────────────────────────────────
+
+import hmac
+import hashlib
+
+def flow_sign(params: dict, secret: str) -> str:
+    """Genera firma HMAC-SHA256 para Flow"""
+    keys = sorted(params.keys())
+    to_sign = "".join(f"{k}{params[k]}" for k in keys)
+    return hmac.new(secret.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+
+@app.post("/api/pago/flow/crear")
+def crear_pago_flow(body: CrearPagoRequest):
+    """Crea pago con Flow usando credenciales del fotógrafo"""
+    ev = supabase.table("eventos").select("*").eq("id", body.evento_id).execute().data
+    if not ev:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+    evento = ev[0]
+
+    fot = supabase.table("fotografos").select(
+        "flow_api_key, flow_secret_key, flow_ambiente"
+    ).eq("id", evento["fotografo_id"]).execute()
+    if not fot.data:
+        return JSONResponse(status_code=400, content={"error": "Fotógrafo no encontrado"})
+    creds = fot.data[0]
+
+    if not creds.get("flow_api_key") or not creds.get("flow_secret_key"):
+        return JSONResponse(status_code=400, content={"error": "Flow no configurado"})
+
+    n = len(body.foto_ids)
+    if n == 0:
+        return JSONResponse(status_code=400, content={"error": "No hay fotos seleccionadas"})
+
+    monto = (evento.get("precio_foto") or 0) * n
+    buy_order = "KF" + uuid.uuid4().hex[:16]
+
+    # Ambiente
+    if creds.get("flow_ambiente") == "production":
+        flow_url = "https://www.flow.cl/api"
+    else:
+        flow_url = "https://sandbox.flow.cl/api"
+
+    api_key = creds["flow_api_key"]
+    secret = creds["flow_secret_key"]
+    url_retorno = f"{BACKEND_URL}/api/pago/flow/retorno"
+
+    params = {
+        "apiKey": api_key,
+        "commerceOrder": buy_order,
+        "subject": f"Fotos evento - {evento.get('nombre', 'Kusipix')}",
+        "currency": "CLP",
+        "amount": int(monto),
+        "email": body.email or "",
+        "urlConfirmation": url_retorno,
+        "urlReturn": url_retorno,
+        "paymentMethod": 9,  # Todos los medios
+    }
+    params["s"] = flow_sign(params, secret)
+
+    # Crear orden en Flow
+    resp = httpx.post(f"{flow_url}/payment/create", data=params, timeout=30)
+    if resp.status_code != 200:
+        return JSONResponse(status_code=400, content={"error": f"Error Flow: {resp.text}"})
+
+    data = resp.json()
+    if data.get("code") and data["code"] != 0:
+        return JSONResponse(status_code=400, content={"error": data.get("message", "Error Flow")})
+
+    flow_token = data.get("token")
+    redirect_url = data.get("url") + "?token=" + flow_token
+
+    # Registrar venta
+    venta_result = supabase.table("ventas").insert({
+        "evento_id": body.evento_id,
+        "fotografo_id": evento["fotografo_id"],
+        "comprador_nombre": body.nombre,
+        "comprador_email": body.email,
+        "monto_total": monto,
+        "metodo_pago": "flow",
+        "referencia_pago": flow_token,
+        "estado": "pendiente",
+        "tipo_compra": "individual" if n == 1 else "pack",
+        "cantidad_fotos": n,
+    }).execute()
+
+    if venta_result.data and body.foto_ids:
+        venta_id = venta_result.data[0]["id"]
+        supabase.table("venta_fotos").insert([
+            {"venta_id": venta_id, "foto_id": fid, "precio": evento.get("precio_foto") or 0}
+            for fid in body.foto_ids
+        ]).execute()
+
+    return {"url": redirect_url, "token": flow_token, "monto": monto}
+
+@app.get("/api/pago/flow/retorno")
+@app.post("/api/pago/flow/retorno")
+async def pago_flow_retorno(token: str = None):
+    """Retorno de Flow después del pago"""
+    if not token:
+        return RedirectResponse("https://kusipix.com?pago=rechazado", status_code=303)
+
+    # Buscar venta
+    venta = supabase.table("ventas").select("*, eventos(slug, fotografo_id)").eq("referencia_pago", token).execute().data
+    if not venta:
+        return RedirectResponse("https://kusipix.com?pago=error", status_code=303)
+    v = venta[0]
+
+    fot_id = v.get("fotografo_id")
+    creds = supabase.table("fotografos").select("flow_api_key, flow_secret_key, flow_ambiente").eq("id", fot_id).execute().data
+    cred = creds[0] if creds else {}
+
+    if cred.get("flow_ambiente") == "production":
+        flow_url = "https://www.flow.cl/api"
+    else:
+        flow_url = "https://sandbox.flow.cl/api"
+
+    api_key = cred.get("flow_api_key", "")
+    secret = cred.get("flow_secret_key", "")
+
+    params = {"apiKey": api_key, "token": token}
+    params["s"] = flow_sign(params, secret)
+
+    resp = httpx.get(f"{flow_url}/payment/getStatus", params=params, timeout=30)
+    data = resp.json() if resp.status_code == 200 else {}
+    aprobado = data.get("status") == 2  # 2 = pagado en Flow
+
+    slug_evento = v.get("eventos", {}).get("slug", "") if isinstance(v.get("eventos"), dict) else ""
+    token_descarga = v.get("token_descarga", "")
+
+    if aprobado:
+        supabase.table("ventas").update({"estado": "completado"}).eq("referencia_pago", token).execute()
+        supabase.table("eventos").update({
+            "total_ventas": (supabase.table("eventos").select("total_ventas").eq("id", v["evento_id"]).execute().data[0].get("total_ventas") or 0) + 1,
+            "monto_total_ventas": (supabase.table("eventos").select("monto_total_ventas").eq("id", v["evento_id"]).execute().data[0].get("monto_total_ventas") or 0) + v["monto_total"],
+        }).eq("id", v["evento_id"]).execute()
+
+        # Enviar email
+        if v.get("comprador_email"):
+            try:
+                resend_key = os.getenv("RESEND_API_KEY", "")
+                if resend_key:
+                    nombre = v.get("comprador_nombre") or "Cliente"
+                    descarga_url = f"https://kusipix.com/descargas/{token_descarga}"
+                    httpx.post("https://api.resend.com/emails",
+                        headers={"Authorization": f"Bearer {resend_key}"},
+                        json={"from": "Kusipix <noreply@kusipix.com>", "to": [v["comprador_email"]],
+                              "subject": "Tus fotos de Kusipix están listas 📸",
+                              "html": f'<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px"><h2 style="color:#7c5cf0">Tus fotos están listas</h2><p>Hola {nombre},</p><p>Tu pago fue exitoso. Descarga tus fotos aquí:</p><div style="text-align:center;margin:30px 0"><a href="{descarga_url}" style="background:#7c5cf0;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold">Descargar mis fotos</a></div><p style="color:#666;font-size:13px">Kusipix - La alegría de encontrarte</p></div>'},
+                        timeout=10)
+            except Exception as e:
+                print(f"Error email Flow: {e}")
+
+    estado = "ok" if aprobado else "rechazado"
+    return RedirectResponse(f"https://kusipix.com/evento/{slug_evento}?pago={estado}&token={token_descarga}", status_code=303)
+
+
 # ─── BÚSQUEDA PÚBLICA ────────────────────────────────────────────────────────
 
 @app.post("/api/buscar-por-selfie")
