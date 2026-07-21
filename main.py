@@ -488,6 +488,13 @@ async def procesar_foto_inline(foto_id, path, filename, evento_id, fotografo_id,
         print(f"Error procesando foto {foto_id}: {e}")
         supabase.table("fotos").update({"procesada": True}).eq("id", foto_id).execute()
 
+class CrearPagoRequest(BaseModel):
+    evento_id: str
+    foto_ids: List[str]
+    nombre: Optional[str] = None
+    email: Optional[str] = None
+    telefono: Optional[str] = None
+
 # ─── PAGO CON FLOW ───────────────────────────────────────────────────────────
 
 import hmac
@@ -937,13 +944,6 @@ async def notificar_venta_fotografo(venta: dict, evento_id: str, fotografo_id: s
 
 
 # ─── PAGOS (Transbank por fotógrafo) ──────────────────────────────────────────
-
-class CrearPagoRequest(BaseModel):
-    evento_id: str
-    foto_ids: List[str]
-    nombre: Optional[str] = None
-    email: Optional[str] = None
-    telefono: Optional[str] = None
 
 @app.post("/api/pago/crear")
 def crear_pago(body: CrearPagoRequest):
