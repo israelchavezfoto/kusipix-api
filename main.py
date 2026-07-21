@@ -1154,13 +1154,37 @@ async def subir_foto_directo(
     album_id: Optional[str] = Form(None),
     fotografo=Depends(get_fotografo)
 ):
-    creditos = fotografo.get("creditos_disponibles") or 0
-    if creditos < 1:
-        return JSONResponse(status_code=400, content={"error": "Créditos insuficientes"})
-    ev = supabase.table("eventos").select("*").eq("id", evento_id).eq("fotografo_id", fotografo["id"]).execute()
+    # Verificar evento — puede ser dueño o colaborador
+    ev = supabase.table("eventos").select("*").eq("id", evento_id).execute()
     if not ev.data:
-        return JSONResponse(status_code=403, content={"error": "Evento no encontrado"})
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
     evento = ev.data[0]
+
+    es_dueno = evento["fotografo_id"] == fotografo["id"]
+    es_colaborador = False
+    colaboracion = None
+
+    if not es_dueno:
+        col = supabase.table("evento_fotografos").select("*").eq("evento_id", evento_id).eq("fotografo_id", fotografo["id"]).eq("estado", "aceptado").execute()
+        if not col.data:
+            return JSONResponse(status_code=403, content={"error": "No tienes permiso para subir fotos a este evento"})
+        es_colaborador = True
+        colaboracion = col.data[0]
+        if colaboracion.get("limite_fotos") is not None:
+            if (colaboracion.get("fotos_subidas") or 0) >= colaboracion["limite_fotos"]:
+                return JSONResponse(status_code=400, content={"error": f"Alcanzaste tu límite de {colaboracion['limite_fotos']} fotos en este evento"})
+        dueno = supabase.table("fotografos").select("id, creditos_disponibles").eq("id", evento["fotografo_id"]).execute()
+        fotografo_pagador = dueno.data[0] if dueno.data else fotografo
+    else:
+        fotografo_pagador = fotografo
+
+    creditos = fotografo_pagador.get("creditos_disponibles") or 0
+    modo = evento.get("modo_busqueda", "facial_dorsal")
+    creditos_consumir = 2 if modo == "facial_dorsal" else 1
+
+    if creditos < creditos_consumir:
+        return JSONResponse(status_code=400, content={"error": f"Créditos insuficientes. Se necesitan {creditos_consumir} créditos para este evento."})
+
     foto_id = str(uuid.uuid4())
     ext = foto.filename.rsplit(".", 1)[-1].lower() if "." in foto.filename else "jpg"
     path = f"{fotografo['id']}/{evento_id}/{foto_id}.{ext}"
@@ -1179,11 +1203,20 @@ async def subir_foto_directo(
     modo = evento.get("modo_busqueda", "facial_dorsal")
     creditos_consumir = 2 if modo == "facial_dorsal" else 1
     nuevo_saldo = creditos - creditos_consumir
-    supabase.table("fotografos").update({"creditos_disponibles": nuevo_saldo}).eq("id", fotografo["id"]).execute()
+    supabase.table("fotografos").update({"creditos_disponibles": nuevo_saldo}).eq("id", fotografo_pagador["id"]).execute()
+    desc = f"Foto: {foto.filename} (modo: {modo})"
+    if es_colaborador:
+        desc += f" — colaborador {fotografo['email']}"
     supabase.table("transacciones_creditos").insert({
-        "fotografo_id": fotografo["id"], "tipo": "consumo", "cantidad": -creditos_consumir,
-        "saldo_despues": nuevo_saldo, "descripcion": f"Foto: {foto.filename} (modo: {modo})"
+        "fotografo_id": fotografo_pagador["id"], "tipo": "consumo", "cantidad": -creditos_consumir,
+        "saldo_despues": nuevo_saldo, "descripcion": desc
     }).execute()
+    
+    # Actualizar contador de fotos del colaborador
+    if es_colaborador and colaboracion:
+        supabase.table("evento_fotografos").update({
+            "fotos_subidas": (colaboracion.get("fotos_subidas") or 0) + 1
+        }).eq("id", colaboracion["id"]).execute()
     supabase.table("eventos").update({"total_fotos": (evento.get("total_fotos") or 0) + 1}).eq("id", evento_id).execute()
     background_tasks.add_task(
         procesar_foto_inline, foto_id, path, foto.filename,
