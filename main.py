@@ -660,14 +660,18 @@ class InvitacionEmailRequest(BaseModel):
 @app.post("/api/notificar-invitacion")
 async def notificar_invitacion(body: InvitacionEmailRequest):
     """Envía email al fotógrafo invitado a colaborar en un evento"""
+    print(f"[INVITACION] Recibida solicitud para: {body.invitado_email}")
     try:
         resend_key = os.getenv("RESEND_API_KEY", "")
+        print(f"[INVITACION] RESEND_API_KEY presente: {bool(resend_key)}, longitud: {len(resend_key) if resend_key else 0}")
         if not resend_key:
+            print("[INVITACION] ERROR: Sin API key de Resend")
             return {"ok": False, "error": "Sin API key de Resend"}
 
         acuerdo = f"Comisión del {body.porcentaje_comision}% sobre tus ventas" if body.tipo_acuerdo == "comision" else "Pago fijo (coordinar directamente con el organizador)"
         limite = f"Límite: {body.limite_fotos:,} fotos".replace(",", ".") if body.limite_fotos else "Sin límite de fotos"
 
+        print(f"[INVITACION] Enviando email a {body.invitado_email}...")
         resp = httpx.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {resend_key}"},
@@ -700,9 +704,13 @@ async def notificar_invitacion(body: InvitacionEmailRequest):
             },
             timeout=10
         )
-        return {"ok": True}
+        print(f"[INVITACION] Resend response: {resp.status_code} - {resp.text[:200]}")
+        if resp.status_code == 200:
+            return {"ok": True}
+        else:
+            return {"ok": False, "error": f"Resend error {resp.status_code}: {resp.text[:200]}"}
     except Exception as e:
-        print(f"Error enviando email invitacion: {e}")
+        print(f"[INVITACION] Exception: {type(e).__name__}: {e}")
         return {"ok": False, "error": str(e)}
 
 
