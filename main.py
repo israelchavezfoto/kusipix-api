@@ -674,7 +674,7 @@ async def notificar_invitacion(body: InvitacionEmailRequest):
             json={
                 "from": "Kusipix <noreply@kusipix.com>",
                 "to": [body.invitado_email],
-                "subject": f"📸 {body.dueno_nombre} te invitó a colaborar en "{body.evento_nombre}"",
+                "subject": f"Invitacion de {body.dueno_nombre} para {body.evento_nombre}",
                 "html": f"""<div style="font-family:sans-serif;max-width:580px;margin:0 auto;background:#0f1117;color:#e2e8f0;border-radius:16px;overflow:hidden">
                     <div style="background:linear-gradient(135deg,#7c5cf0,#3b82f6);padding:32px;text-align:center">
                         <div style="font-size:48px;margin-bottom:8px">📸</div>
