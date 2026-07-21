@@ -647,6 +647,58 @@ async def pago_flow_retorno(token: str = None):
     return RedirectResponse(f"https://kusipix.com/evento/{slug_evento}?pago={estado}&token={token_descarga}", status_code=303)
 
 
+# ─── DESCARGA GRATUITA ───────────────────────────────────────────────────────
+
+class DescargaGratisRequest(BaseModel):
+    evento_id: str
+    foto_ids: List[str]
+    nombre: Optional[str] = "Descarga gratuita"
+    email: Optional[str] = ""
+
+@app.post("/api/descarga-gratis")
+def descarga_gratis(body: DescargaGratisRequest):
+    """Genera token de descarga gratuita para eventos sin costo"""
+    ev = supabase.table("eventos").select("*").eq("id", body.evento_id).execute()
+    if not ev.data:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+    evento = ev.data[0]
+
+    if not evento.get("es_gratuito"):
+        return JSONResponse(status_code=403, content={"error": "Este evento no es gratuito"})
+
+    if not body.foto_ids:
+        return JSONResponse(status_code=400, content={"error": "No hay fotos seleccionadas"})
+
+    # Crear venta con monto 0
+    token_descarga = str(uuid.uuid4())
+    venta_result = supabase.table("ventas").insert({
+        "evento_id": body.evento_id,
+        "fotografo_id": evento["fotografo_id"],
+        "comprador_nombre": body.nombre or "Descarga gratuita",
+        "comprador_email": body.email or "",
+        "monto_total": 0,
+        "metodo_pago": "gratuito",
+        "referencia_pago": token_descarga,
+        "estado": "completado",
+        "tipo_compra": "gratuito",
+        "cantidad_fotos": len(body.foto_ids),
+        "token_descarga": token_descarga,
+    }).execute()
+
+    if not venta_result.data:
+        return JSONResponse(status_code=500, content={"error": "Error al crear descarga"})
+
+    venta_id = venta_result.data[0]["id"]
+
+    # Asociar fotos
+    supabase.table("venta_fotos").insert([
+        {"venta_id": venta_id, "foto_id": fid, "precio": 0}
+        for fid in body.foto_ids
+    ]).execute()
+
+    return {"token": token_descarga, "ok": True}
+
+
 # ─── BÚSQUEDA PÚBLICA ────────────────────────────────────────────────────────
 
 @app.post("/api/buscar-por-selfie")
