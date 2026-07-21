@@ -1123,10 +1123,14 @@ async def subir_foto_directo(
     if album_id:
         foto_data["album_id"] = album_id
     supabase.table("fotos").insert(foto_data).execute()
-    supabase.table("fotografos").update({"creditos_disponibles": creditos - 1}).eq("id", fotografo["id"]).execute()
+    # Créditos según modo: facial+dorsal = 2, cualquier otro = 1
+    modo = evento.get("modo_busqueda", "facial_dorsal")
+    creditos_consumir = 2 if modo == "facial_dorsal" else 1
+    nuevo_saldo = creditos - creditos_consumir
+    supabase.table("fotografos").update({"creditos_disponibles": nuevo_saldo}).eq("id", fotografo["id"]).execute()
     supabase.table("transacciones_creditos").insert({
-        "fotografo_id": fotografo["id"], "tipo": "consumo", "cantidad": -1,
-        "saldo_despues": creditos - 1, "descripcion": f"Foto: {foto.filename}"
+        "fotografo_id": fotografo["id"], "tipo": "consumo", "cantidad": -creditos_consumir,
+        "saldo_despues": nuevo_saldo, "descripcion": f"Foto: {foto.filename} (modo: {modo})"
     }).execute()
     supabase.table("eventos").update({"total_fotos": (evento.get("total_fotos") or 0) + 1}).eq("id", evento_id).execute()
     background_tasks.add_task(
