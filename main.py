@@ -651,7 +651,7 @@ async def pago_flow_retorno(token: str = None):
 
 class InvitacionEmailRequest(BaseModel):
     invitado_email: str
-    dueño_nombre: str
+    dueno_nombre: str
     evento_nombre: str
     tipo_acuerdo: str
     porcentaje_comision: Optional[float] = None
@@ -674,7 +674,7 @@ async def notificar_invitacion(body: InvitacionEmailRequest):
             json={
                 "from": "Kusipix <noreply@kusipix.com>",
                 "to": [body.invitado_email],
-                "subject": f"📸 {body.dueño_nombre} te invitó a colaborar en "{body.evento_nombre}"",
+                "subject": f"📸 {body.dueno_nombre} te invitó a colaborar en "{body.evento_nombre}"",
                 "html": f"""<div style="font-family:sans-serif;max-width:580px;margin:0 auto;background:#0f1117;color:#e2e8f0;border-radius:16px;overflow:hidden">
                     <div style="background:linear-gradient(135deg,#7c5cf0,#3b82f6);padding:32px;text-align:center">
                         <div style="font-size:48px;margin-bottom:8px">📸</div>
@@ -682,7 +682,7 @@ async def notificar_invitacion(body: InvitacionEmailRequest):
                     </div>
                     <div style="padding:28px">
                         <p style="font-size:15px;color:#8892a4;margin:0 0 16px">Hola,</p>
-                        <p style="font-size:15px;color:#e2e8f0;margin:0 0 20px"><strong>{body.dueño_nombre}</strong> te ha invitado a colaborar como fotógrafo en:</p>
+                        <p style="font-size:15px;color:#e2e8f0;margin:0 0 20px"><strong>{body.dueno_nombre}</strong> te ha invitado a colaborar como fotógrafo en:</p>
                         <div style="background:#1a1d27;border-radius:12px;padding:20px;margin-bottom:20px;border:1px solid #2a2d3a">
                             <div style="font-size:18px;font-weight:700;color:#e2e8f0;margin-bottom:12px">{body.evento_nombre}</div>
                             <div style="font-size:14px;color:#8892a4;margin-bottom:6px">💰 Acuerdo: {acuerdo}</div>
