@@ -869,6 +869,168 @@ def fotos_evento_publico(slug: str, dorsal: Optional[str] = None, album_id: Opti
 
     return {"fotos": resultado.data, "total": total, "pagina": pagina}
 
+# ─── COMPRA DE CRÉDITOS (Flow del admin) ─────────────────────────────────────
+
+class ComprarCreditosRequest(BaseModel):
+    paquete_id: str
+    fotografo_id: Optional[str] = None
+
+@app.post("/api/creditos/comprar")
+async def comprar_creditos(request: Request, body: ComprarCreditosRequest):
+    """Crea pago en Flow para comprar créditos usando las credenciales del admin"""
+    # Obtener fotógrafo autenticado
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.replace("Bearer ", "")
+    
+    # Verificar usuario via Supabase
+    user_resp = httpx.get(
+        f"{os.getenv('SUPABASE_URL')}/auth/v1/user",
+        headers={"Authorization": f"Bearer {token}", "apikey": os.getenv("SUPABASE_ANON_KEY")}
+    )
+    if user_resp.status_code != 200:
+        return JSONResponse(status_code=401, content={"error": "No autenticado"})
+    
+    user = user_resp.json()
+    fot = supabase.table("fotografos").select("id, email, nombre").eq("auth_user_id", user["id"]).execute()
+    if not fot.data:
+        return JSONResponse(status_code=404, content={"error": "Fotógrafo no encontrado"})
+    fotografo = fot.data[0]
+
+    # Obtener paquete
+    pkg = supabase.table("paquetes_creditos").select("*").eq("id", body.paquete_id).execute()
+    if not pkg.data:
+        return JSONResponse(status_code=404, content={"error": "Paquete no encontrado"})
+    paquete = pkg.data[0]
+
+    # Credenciales Flow del admin
+    flow_api_key = os.getenv("FLOW_API_KEY", "")
+    flow_secret_key = os.getenv("FLOW_SECRET_KEY", "")
+    flow_ambiente = os.getenv("FLOW_AMBIENTE", "sandbox")
+
+    if not flow_api_key or not flow_secret_key:
+        return JSONResponse(status_code=500, content={"error": "Flow no configurado en el servidor"})
+
+    flow_url = "https://www.flow.cl/api" if flow_ambiente == "production" else "https://sandbox.flow.cl/api"
+
+    buy_order = "KC" + uuid.uuid4().hex[:16]
+    monto = int(paquete["precio"])
+
+    params = {
+        "apiKey": flow_api_key,
+        "commerceOrder": buy_order,
+        "subject": f"Kusipix - {paquete['nombre']} ({paquete['cantidad']} créditos)",
+        "currency": "CLP",
+        "amount": monto,
+        "email": fotografo["email"],
+        "urlConfirmation": f"{BACKEND_URL}/api/creditos/flow-confirmacion",
+        "urlReturn": f"{BACKEND_URL}/api/creditos/flow-retorno",
+        "paymentMethod": 9,
+    }
+    params["s"] = flow_sign(params, flow_secret_key)
+
+    resp = httpx.post(f"{flow_url}/payment/create", data=params, timeout=30)
+    if resp.status_code != 200:
+        return JSONResponse(status_code=400, content={"error": f"Error Flow: {resp.text}"})
+
+    data = resp.json()
+    flow_token = data.get("token")
+    redirect_url = data.get("url") + "?token=" + flow_token
+
+    # Guardar referencia de compra pendiente
+    supabase.table("transacciones_creditos").insert({
+        "fotografo_id": fotografo["id"],
+        "tipo": "compra_pendiente",
+        "cantidad": paquete["cantidad"],
+        "saldo_despues": 0,
+        "descripcion": f"Compra pendiente: {paquete['nombre']} ({paquete['cantidad']} créditos) - {buy_order}",
+    }).execute()
+
+    return {"url": redirect_url, "token": flow_token, "monto": monto}
+
+
+@app.post("/api/creditos/flow-confirmacion")
+async def creditos_flow_confirmacion(request: Request):
+    """Callback de Flow cuando el pago se confirma (server-to-server)"""
+    form = await request.form()
+    token = form.get("token") or ""
+    
+    flow_api_key = os.getenv("FLOW_API_KEY", "")
+    flow_secret_key = os.getenv("FLOW_SECRET_KEY", "")
+    flow_ambiente = os.getenv("FLOW_AMBIENTE", "sandbox")
+    flow_url = "https://www.flow.cl/api" if flow_ambiente == "production" else "https://sandbox.flow.cl/api"
+
+    params = {"apiKey": flow_api_key, "token": token}
+    params["s"] = flow_sign(params, flow_secret_key)
+
+    resp = httpx.get(f"{flow_url}/payment/getStatus", params=params, timeout=30)
+    if resp.status_code != 200:
+        print(f"[CREDITOS] Error getStatus: {resp.text}")
+        return {"ok": False}
+
+    data = resp.json()
+    if data.get("status") != 2:  # 2 = pagado
+        print(f"[CREDITOS] Pago no completado: status={data.get('status')}")
+        return {"ok": False}
+
+    commerce_order = data.get("commerceOrder", "")
+    email = data.get("payer", "")
+
+    # Buscar fotógrafo y paquete
+    fot = supabase.table("fotografos").select("id, creditos_disponibles, email").eq("email", email).execute()
+    if not fot.data:
+        print(f"[CREDITOS] Fotógrafo no encontrado: {email}")
+        return {"ok": False}
+    fotografo = fot.data[0]
+
+    # Encontrar la transacción pendiente
+    pending = supabase.table("transacciones_creditos").select("*").eq("fotografo_id", fotografo["id"]).eq("tipo", "compra_pendiente").like("descripcion", f"%{commerce_order}%").execute()
+    if not pending.data:
+        print(f"[CREDITOS] Transacción pendiente no encontrada: {commerce_order}")
+        return {"ok": False}
+
+    creditos_comprados = pending.data[0]["cantidad"]
+    nuevo_saldo = (fotografo.get("creditos_disponibles") or 0) + creditos_comprados
+
+    # Acreditar créditos
+    supabase.table("fotografos").update({
+        "creditos_disponibles": nuevo_saldo
+    }).eq("id", fotografo["id"]).execute()
+
+    # Actualizar transacción
+    supabase.table("transacciones_creditos").update({
+        "tipo": "compra_paquete",
+        "saldo_despues": nuevo_saldo,
+        "descripcion": pending.data[0]["descripcion"].replace("Compra pendiente:", "Compra completada:")
+    }).eq("id", pending.data[0]["id"]).execute()
+
+    print(f"[CREDITOS] Compra exitosa: {email} +{creditos_comprados} créditos (saldo: {nuevo_saldo})")
+    return {"ok": True}
+
+
+@app.get("/api/creditos/flow-retorno")
+@app.post("/api/creditos/flow-retorno")
+async def creditos_flow_retorno(request: Request, token: str = None):
+    """Retorno del usuario después de pagar en Flow"""
+    if not token:
+        form = await request.form()
+        token = form.get("token") or ""
+
+    flow_api_key = os.getenv("FLOW_API_KEY", "")
+    flow_secret_key = os.getenv("FLOW_SECRET_KEY", "")
+    flow_ambiente = os.getenv("FLOW_AMBIENTE", "sandbox")
+    flow_url = "https://www.flow.cl/api" if flow_ambiente == "production" else "https://sandbox.flow.cl/api"
+
+    params = {"apiKey": flow_api_key, "token": token}
+    params["s"] = flow_sign(params, flow_secret_key)
+
+    resp = httpx.get(f"{flow_url}/payment/getStatus", params=params, timeout=30)
+    data = resp.json() if resp.status_code == 200 else {}
+    aprobado = data.get("status") == 2
+
+    estado = "ok" if aprobado else "error"
+    return RedirectResponse(f"https://kusipix.com/panel?compra={estado}", status_code=303)
+
+
 # ─── HELPER: Notificar fotógrafo por venta ───────────────────────────────────
 
 async def notificar_venta_fotografo(venta: dict, evento_id: str, fotografo_id: str):
