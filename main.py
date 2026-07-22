@@ -1445,6 +1445,65 @@ class CotizarRequest(BaseModel):
     cupon_codigo: Optional[str] = None
     comprar_todas: bool = False
 
+class ActualizarPrecioEventoRequest(BaseModel):
+    precio_foto: Optional[int] = None
+    precio_todas: Optional[int] = None  # enviar null para desactivar el pack
+
+@app.put("/api/eventos/{evento_id}/precio")
+def actualizar_precio_evento(evento_id: str, body: ActualizarPrecioEventoRequest, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    ev = supabase.table("eventos").select("id, fotografo_id, es_gratuito").eq("id", evento_id).execute().data
+    if not ev or ev[0]["fotografo_id"] != fotografo_id:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+    if ev[0]["es_gratuito"]:
+        return JSONResponse(status_code=400, content={"error": "No se puede fijar precio en un evento gratuito"})
+
+    updates = {}
+    if body.precio_foto is not None:
+        if body.precio_foto <= 0:
+            return JSONResponse(status_code=400, content={"error": "El precio por foto debe ser mayor a 0"})
+        updates["precio_foto"] = body.precio_foto
+    # precio_todas puede ser explicitamente None para desactivar el pack, por eso se chequea aparte
+    if "precio_todas" in body.model_fields_set:
+        if body.precio_todas is not None and body.precio_todas <= 0:
+            return JSONResponse(status_code=400, content={"error": "El precio del pack debe ser mayor a 0"})
+        updates["precio_todas"] = body.precio_todas
+
+    if not updates:
+        return JSONResponse(status_code=400, content={"error": "No hay cambios para aplicar"})
+
+    supabase.table("eventos").update(updates).eq("id", evento_id).execute()
+    return {"ok": True}
+
+
+@app.get("/api/eventos/{evento_id}/resumen-ventas")
+def resumen_ventas_evento(evento_id: str, authorization: Optional[str] = Header(None)):
+    """Trae en una sola llamada: precio, pack completo, tramos de descuento y cupones del evento.
+    Usado por el dashboard de detalle del evento en el panel del fotografo."""
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+
+    ev = supabase.table("eventos").select("id, nombre, precio_foto, precio_todas, fotografo_id").eq("id", evento_id).execute().data
+    if not ev or ev[0]["fotografo_id"] != fotografo_id:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+    evento = ev[0]
+
+    tramos_evento = supabase.table("reglas_descuento_cantidad").select("*").eq("evento_id", evento_id).eq("activo", True).order("cantidad_minima").execute().data
+    tramos_globales = supabase.table("reglas_descuento_cantidad").select("*").eq("fotografo_id", fotografo_id).is_("evento_id", "null").eq("activo", True).order("cantidad_minima").execute().data
+    cupones = supabase.table("cupones").select("*").eq("evento_id", evento_id).order("created_at", desc=True).execute().data
+
+    return {
+        "precio_foto": evento.get("precio_foto"),
+        "precio_todas": evento.get("precio_todas"),
+        "tramos_evento": tramos_evento,
+        "tramos_globales": tramos_globales,
+        "cupones": cupones,
+    }
+
+
 @app.post("/api/cotizar")
 def cotizar_precio(body: CotizarRequest):
     """Endpoint publico: calcula el precio final SIN crear la venta ni consumir el cupon.
