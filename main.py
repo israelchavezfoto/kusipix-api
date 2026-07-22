@@ -494,6 +494,68 @@ class CrearPagoRequest(BaseModel):
     nombre: Optional[str] = None
     email: Optional[str] = None
     telefono: Optional[str] = None
+    cupon_codigo: Optional[str] = None
+    comprar_todas: bool = False
+
+def calcular_monto_venta(evento: dict, foto_ids: list, cupon_codigo: Optional[str], comprar_todas: bool):
+    """
+    Calcula el monto final de una venta aplicando, en orden excluyente:
+    1. Pack completo (precio_todas) si comprar_todas=True
+    2. Cupón si se entrega cupon_codigo valido
+    3. Descuento por cantidad (tramos configurados por el fotografo)
+    Retorna dict con: monto, tipo_compra, cupon_id, descuento_aplicado, error (si aplica)
+    """
+    n = len(foto_ids)
+    precio_foto = evento.get("precio_foto") or 0
+
+    # 1. Pack completo (excluyente con todo lo demas)
+    if comprar_todas:
+        precio_todas = evento.get("precio_todas")
+        if not precio_todas:
+            return {"error": "Este evento no tiene pack completo configurado"}
+        return {
+            "monto": precio_todas,
+            "tipo_compra": "todas",
+            "cupon_id": None,
+            "cupon_codigo": None,
+            "descuento_aplicado": 0,
+        }
+
+    monto_base = precio_foto * n
+
+    # 2. Cupon (excluyente con descuento por cantidad)
+    if cupon_codigo:
+        res = supabase.rpc("aplicar_cupon", {
+            "p_evento_id": evento["id"],
+            "p_codigo": cupon_codigo,
+            "p_monto_original": monto_base,
+        }).execute()
+        data = res.data or {}
+        if not data.get("valido"):
+            return {"error": data.get("error", "Cupón inválido")}
+        return {
+            "monto": data["monto_final"],
+            "tipo_compra": "individual" if n == 1 else "pack",
+            "cupon_id": data["cupon_id"],
+            "cupon_codigo": data["codigo"],
+            "descuento_aplicado": data["descuento"],
+        }
+
+    # 3. Descuento por cantidad
+    porcentaje = supabase.rpc("calcular_descuento_cantidad", {
+        "p_evento_id": evento["id"],
+        "p_fotografo_id": evento["fotografo_id"],
+        "p_cantidad": n,
+    }).execute()
+    pct = (porcentaje.data or 0) if porcentaje.data is not None else 0
+    descuento = round(monto_base * pct / 100)
+    return {
+        "monto": monto_base - descuento,
+        "tipo_compra": "individual" if n == 1 else "pack",
+        "cupon_id": None,
+        "cupon_codigo": None,
+        "descuento_aplicado": descuento,
+    }
 
 # ─── PAGO CON FLOW ───────────────────────────────────────────────────────────
 
@@ -524,11 +586,14 @@ def crear_pago_flow(body: CrearPagoRequest):
     if not creds.get("flow_api_key") or not creds.get("flow_secret_key"):
         return JSONResponse(status_code=400, content={"error": "Flow no configurado"})
 
-    n = len(body.foto_ids)
-    if n == 0:
+    if not body.comprar_todas and len(body.foto_ids) == 0:
         return JSONResponse(status_code=400, content={"error": "No hay fotos seleccionadas"})
 
-    monto = (evento.get("precio_foto") or 0) * n
+    calculo = calcular_monto_venta(evento, body.foto_ids, body.cupon_codigo, body.comprar_todas)
+    if calculo.get("error"):
+        return JSONResponse(status_code=400, content={"error": calculo["error"]})
+    monto = calculo["monto"]
+    n = len(body.foto_ids)
     buy_order = "KF" + uuid.uuid4().hex[:16]
 
     # Ambiente
@@ -566,6 +631,10 @@ def crear_pago_flow(body: CrearPagoRequest):
     flow_token = data.get("token")
     redirect_url = data.get("url") + "?token=" + flow_token
 
+    # En pack completo, foto_ids debe venir con TODAS las fotos del participante
+    # (ya calculadas por el frontend via la busqueda facial/dorsal previa)
+    foto_ids_finales = body.foto_ids
+
     # Registrar venta
     venta_result = supabase.table("ventas").insert({
         "evento_id": body.evento_id,
@@ -576,15 +645,18 @@ def crear_pago_flow(body: CrearPagoRequest):
         "metodo_pago": "flow",
         "referencia_pago": flow_token,
         "estado": "pendiente",
-        "tipo_compra": "individual" if n == 1 else "pack",
-        "cantidad_fotos": n,
+        "tipo_compra": calculo["tipo_compra"],
+        "cantidad_fotos": len(foto_ids_finales),
+        "cupon_usado": calculo.get("cupon_codigo"),
+        "descuento_aplicado": calculo.get("descuento_aplicado", 0),
     }).execute()
 
-    if venta_result.data and body.foto_ids:
+    if venta_result.data and foto_ids_finales:
         venta_id = venta_result.data[0]["id"]
+        precio_unitario = monto // len(foto_ids_finales) if len(foto_ids_finales) else 0
         supabase.table("venta_fotos").insert([
-            {"venta_id": venta_id, "foto_id": fid, "precio": evento.get("precio_foto") or 0}
-            for fid in body.foto_ids
+            {"venta_id": venta_id, "foto_id": fid, "precio": precio_unitario}
+            for fid in foto_ids_finales
         ]).execute()
 
     return {"url": redirect_url, "token": flow_token, "monto": monto}
@@ -1126,14 +1198,19 @@ def crear_pago(body: CrearPagoRequest):
         return JSONResponse(status_code=400, content={"error": "Fotógrafo no configurado"})
     creds = fot.data[0]
 
-    n = len(body.foto_ids)
-    if n == 0:
+    if not body.comprar_todas and len(body.foto_ids) == 0:
         return JSONResponse(status_code=400, content={"error": "No hay fotos seleccionadas"})
 
-    monto = (evento.get("precio_foto") or 0) * n
+    calculo = calcular_monto_venta(evento, body.foto_ids, body.cupon_codigo, body.comprar_todas)
+    if calculo.get("error"):
+        return JSONResponse(status_code=400, content={"error": calculo["error"]})
+    monto = calculo["monto"]
 
     buy_order = "KP" + uuid.uuid4().hex[:18]
     session_id = uuid.uuid4().hex[:18]
+
+    # En pack completo, foto_ids debe venir con TODAS las fotos del participante
+    foto_ids_finales = body.foto_ids
 
     # Registrar venta
     venta_result = supabase.table("ventas").insert({
@@ -1146,17 +1223,19 @@ def crear_pago(body: CrearPagoRequest):
         "metodo_pago": "transbank",
         "referencia_pago": buy_order,
         "estado": "pendiente",
-        "tipo_compra": "individual" if n == 1 else "pack",
-        "cantidad_fotos": n,
+        "tipo_compra": calculo["tipo_compra"],
+        "cantidad_fotos": len(foto_ids_finales),
+        "cupon_usado": calculo.get("cupon_codigo"),
+        "descuento_aplicado": calculo.get("descuento_aplicado", 0),
     }).execute()
 
     # Guardar fotos en venta_fotos
-    if venta_result.data and body.foto_ids:
+    if venta_result.data and foto_ids_finales:
         venta_id = venta_result.data[0]["id"]
-        precio_por_foto = evento.get("precio_foto") or 0
+        precio_unitario = monto // len(foto_ids_finales) if len(foto_ids_finales) else 0
         supabase.table("venta_fotos").insert([
-            {"venta_id": venta_id, "foto_id": fid, "precio": precio_por_foto}
-            for fid in body.foto_ids
+            {"venta_id": venta_id, "foto_id": fid, "precio": precio_unitario}
+            for fid in foto_ids_finales
         ]).execute()
 
     # Crear transacción Transbank con credenciales del fotógrafo
@@ -1250,6 +1329,167 @@ async def pago_retorno(token_ws: str = None):
             print(f"Error email: {e}")
 
     return RedirectResponse(f"https://kusipix.com/evento/{slug_evento}?pago={estado}&token={token_descarga}", status_code=303)
+
+# ─── DESCUENTOS Y CUPONES ────────────────────────────────────────────────────
+
+class ReglaDescuentoRequest(BaseModel):
+    evento_id: Optional[str] = None  # None = regla global del fotografo
+    cantidad_minima: int
+    porcentaje_descuento: float
+
+def _fotografo_id_desde_auth(authorization: Optional[str]):
+    """Obtiene el fotografo_id a partir del JWT en el header Authorization"""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ")[1]
+    try:
+        user = supabase.auth.get_user(token)
+        auth_user_id = user.user.id
+        fot = supabase.table("fotografos").select("id").eq("auth_user_id", auth_user_id).execute()
+        if fot.data:
+            return fot.data[0]["id"]
+    except Exception as e:
+        print(f"Error auth: {e}")
+    return None
+
+@app.get("/api/descuentos/reglas")
+def listar_reglas_descuento(authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    res = supabase.table("reglas_descuento_cantidad").select("*").eq("fotografo_id", fotografo_id).order("cantidad_minima").execute()
+    return {"reglas": res.data}
+
+@app.post("/api/descuentos/reglas")
+def crear_regla_descuento(body: ReglaDescuentoRequest, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    if body.cantidad_minima < 2:
+        return JSONResponse(status_code=400, content={"error": "La cantidad mínima debe ser 2 o más"})
+    if body.porcentaje_descuento <= 0 or body.porcentaje_descuento > 90:
+        return JSONResponse(status_code=400, content={"error": "El descuento debe ser entre 1% y 90%"})
+    res = supabase.table("reglas_descuento_cantidad").insert({
+        "fotografo_id": fotografo_id,
+        "evento_id": body.evento_id,
+        "cantidad_minima": body.cantidad_minima,
+        "porcentaje_descuento": body.porcentaje_descuento,
+    }).execute()
+    return {"regla": res.data[0] if res.data else None}
+
+@app.delete("/api/descuentos/reglas/{regla_id}")
+def eliminar_regla_descuento(regla_id: str, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    supabase.table("reglas_descuento_cantidad").delete().eq("id", regla_id).eq("fotografo_id", fotografo_id).execute()
+    return {"ok": True}
+
+
+class CuponRequest(BaseModel):
+    evento_id: str
+    codigo: str
+    tipo_descuento: str  # 'porcentaje' | 'monto_fijo'
+    valor: float
+    limite_usos: Optional[int] = None
+    fecha_expiracion: Optional[str] = None
+
+@app.get("/api/cupones")
+def listar_cupones(evento_id: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    q = supabase.table("cupones").select("*").eq("fotografo_id", fotografo_id)
+    if evento_id:
+        q = q.eq("evento_id", evento_id)
+    res = q.order("created_at", desc=True).execute()
+    return {"cupones": res.data}
+
+@app.post("/api/cupones")
+def crear_cupon(body: CuponRequest, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    if body.tipo_descuento not in ("porcentaje", "monto_fijo"):
+        return JSONResponse(status_code=400, content={"error": "Tipo de descuento inválido"})
+    if body.valor <= 0:
+        return JSONResponse(status_code=400, content={"error": "El valor debe ser mayor a 0"})
+    try:
+        res = supabase.table("cupones").insert({
+            "fotografo_id": fotografo_id,
+            "evento_id": body.evento_id,
+            "codigo": body.codigo.strip().upper(),
+            "tipo_descuento": body.tipo_descuento,
+            "valor": body.valor,
+            "limite_usos": body.limite_usos,
+            "fecha_expiracion": body.fecha_expiracion,
+        }).execute()
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            return JSONResponse(status_code=400, content={"error": "Ya existe un cupón con ese código en este evento"})
+        return JSONResponse(status_code=400, content={"error": "No se pudo crear el cupón"})
+    return {"cupon": res.data[0] if res.data else None}
+
+@app.delete("/api/cupones/{cupon_id}")
+def eliminar_cupon(cupon_id: str, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    supabase.table("cupones").delete().eq("id", cupon_id).eq("fotografo_id", fotografo_id).execute()
+    return {"ok": True}
+
+
+class CotizarRequest(BaseModel):
+    evento_id: str
+    foto_ids: List[str] = []
+    cupon_codigo: Optional[str] = None
+    comprar_todas: bool = False
+
+@app.post("/api/cotizar")
+def cotizar_precio(body: CotizarRequest):
+    """Endpoint publico: calcula el precio final SIN crear la venta ni consumir el cupon.
+    Se usa para mostrar el precio en el checkout antes de pagar."""
+    ev = supabase.table("eventos").select("*").eq("id", body.evento_id).execute().data
+    if not ev:
+        return JSONResponse(status_code=404, content={"error": "Evento no encontrado"})
+    evento = ev[0]
+
+    if body.comprar_todas:
+        precio_todas = evento.get("precio_todas")
+        if not precio_todas:
+            return JSONResponse(status_code=400, content={"error": "Este evento no tiene pack completo"})
+        return {"monto": precio_todas, "tipo_compra": "todas", "descuento_aplicado": 0}
+
+    n = len(body.foto_ids)
+    if n == 0:
+        return JSONResponse(status_code=400, content={"error": "No hay fotos seleccionadas"})
+    monto_base = (evento.get("precio_foto") or 0) * n
+
+    if body.cupon_codigo:
+        # Solo previsualiza: valida sin consumir usando SELECT directo (no la RPC que incrementa uso)
+        cup = supabase.table("cupones").select("*").eq("evento_id", body.evento_id).ilike("codigo", body.cupon_codigo).eq("activo", True).execute()
+        if not cup.data:
+            return JSONResponse(status_code=400, content={"error": "Cupón no encontrado"})
+        c = cup.data[0]
+        if c.get("fecha_expiracion") and c["fecha_expiracion"] < datetime.utcnow().isoformat():
+            return JSONResponse(status_code=400, content={"error": "Cupón expirado"})
+        if c.get("limite_usos") is not None and c["usos_actuales"] >= c["limite_usos"]:
+            return JSONResponse(status_code=400, content={"error": "Cupón agotado"})
+        if c["tipo_descuento"] == "porcentaje":
+            descuento = round(monto_base * c["valor"] / 100)
+        else:
+            descuento = min(c["valor"], monto_base)
+        return {"monto": monto_base - descuento, "tipo_compra": "individual" if n == 1 else "pack", "descuento_aplicado": descuento}
+
+    porcentaje = supabase.rpc("calcular_descuento_cantidad", {
+        "p_evento_id": body.evento_id,
+        "p_fotografo_id": evento["fotografo_id"],
+        "p_cantidad": n,
+    }).execute()
+    pct = (porcentaje.data or 0) if porcentaje.data is not None else 0
+    descuento = round(monto_base * pct / 100)
+    return {"monto": monto_base - descuento, "tipo_compra": "individual" if n == 1 else "pack", "descuento_aplicado": descuento}
+
 
 # ─── DESCARGA DE FOTOS COMPRADAS ─────────────────────────────────────────────
 
