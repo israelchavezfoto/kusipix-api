@@ -1672,6 +1672,31 @@ async def reprocesar_fotos(evento_id: str, background_tasks: BackgroundTasks, fo
     return {"mensaje": f"Reprocesando {len(pendientes)} fotos", "total": len(pendientes)}
 
 
+@app.post("/api/eventos/portada")
+async def subir_portada_evento(portada: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+    """Sube una imagen de portada para un evento (se usa antes de crear el evento).
+    Devuelve la URL publica que luego se pasa a crear_evento como p_portada_url."""
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+
+    if not portada.content_type or not portada.content_type.startswith("image/"):
+        return JSONResponse(status_code=400, content={"error": "El archivo debe ser una imagen"})
+
+    contenido = await portada.read()
+    if len(contenido) > 5 * 1024 * 1024:
+        return JSONResponse(status_code=400, content={"error": "La imagen no puede superar 5MB"})
+
+    ext = (portada.filename or "jpg").split(".")[-1].lower()
+    if ext not in ("jpg", "jpeg", "png", "webp"):
+        ext = "jpg"
+    path = f"{fotografo_id}/{uuid.uuid4().hex}.{ext}"
+
+    supabase.storage.from_("portadas-eventos").upload(path, contenido, {"content-type": portada.content_type})
+    url = f"{SUPABASE_URL}/storage/v1/object/public/portadas-eventos/{path}"
+    return {"url": url}
+
+
 # ─── SUBIDA DIRECTA AL BACKEND ────────────────────────────────────────────────
 
 @app.post("/api/subir-foto")
