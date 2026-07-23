@@ -1818,7 +1818,7 @@ async def subir_foto_directo(
         if colaboracion.get("limite_fotos") is not None:
             if (colaboracion.get("fotos_subidas") or 0) >= colaboracion["limite_fotos"]:
                 return JSONResponse(status_code=400, content={"error": f"Alcanzaste tu límite de {colaboracion['limite_fotos']} fotos en este evento"})
-        dueno = supabase.table("fotografos").select("id, creditos_disponibles").eq("id", evento["fotografo_id"]).execute()
+        dueno = supabase.table("fotografos").select("id, creditos_disponibles, marca_agua_url").eq("id", evento["fotografo_id"]).execute()
         fotografo_pagador = dueno.data[0] if dueno.data else fotografo
     else:
         fotografo_pagador = fotografo
@@ -1832,14 +1832,18 @@ async def subir_foto_directo(
 
     foto_id = str(uuid.uuid4())
     ext = foto.filename.rsplit(".", 1)[-1].lower() if "." in foto.filename else "jpg"
-    path = f"{fotografo['id']}/{evento_id}/{foto_id}.{ext}"
+    # Las fotos siempre quedan bajo la carpeta del DUEÑO del evento, sin importar quien las suba
+    # (evita que un colaborador pueda borrarlas despues via su propio permiso de storage)
+    dueno_id = evento["fotografo_id"]
+    path = f"{dueno_id}/{evento_id}/{foto_id}.{ext}"
     contenido = await foto.read()
     supabase.storage.from_("fotos-originales").upload(path, contenido, {"content-type": foto.content_type or "image/jpeg"})
     foto_data = {
-        "id": foto_id, "evento_id": evento_id, "fotografo_id": fotografo["id"],
+        "id": foto_id, "evento_id": evento_id, "fotografo_id": dueno_id,
         "url_original": path, "nombre_archivo": foto.filename,
         "tamano_bytes": len(contenido), "procesada": False,
         "tiene_rostros": False, "cantidad_rostros": 0, "face_ids": [],
+        "subido_por": fotografo["id"] if es_colaborador else None,
     }
     if album_id:
         foto_data["album_id"] = album_id
@@ -1863,9 +1867,10 @@ async def subir_foto_directo(
             "fotos_subidas": (colaboracion.get("fotos_subidas") or 0) + 1
         }).eq("id", colaboracion["id"]).execute()
     supabase.table("eventos").update({"total_fotos": (evento.get("total_fotos") or 0) + 1}).eq("id", evento_id).execute()
+    marca_agua = fotografo_pagador.get("marca_agua_url") if es_colaborador else fotografo.get("marca_agua_url")
     background_tasks.add_task(
         procesar_foto_inline, foto_id, path, foto.filename,
-        evento_id, fotografo["id"], evento.get("modo_busqueda", "facial_dorsal"),
-        fotografo.get("marca_agua_url")
+        evento_id, dueno_id, evento.get("modo_busqueda", "facial_dorsal"),
+        marca_agua
     )
     return {"foto_id": foto_id, "estado": "procesando", "creditos_restantes": creditos - 1}
