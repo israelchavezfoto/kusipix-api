@@ -356,26 +356,63 @@ async def procesar_foto_inline(foto_id, path, filename, evento_id, fotografo_id,
         from PIL import Image, ImageDraw, ImageFont
         import io
 
-        img = Image.open(io.BytesIO(data))
-        draw = ImageDraw.Draw(img)
-
-        # Marca de agua de texto simple (se mejora con logo después)
+        img = Image.open(io.BytesIO(data)).convert("RGBA")
         w, h = img.size
-        texto = "© Kusipix"
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(24, w // 30))
-        except Exception:
-            font = ImageFont.load_default()
 
-        # Marca de agua diagonal repetida
-        for y in range(0, h, h // 4):
-            for x in range(0, w, w // 3):
-                draw.text((x, y), texto, fill=(255, 255, 255, 80), font=font)
+        # Config de marca de agua del dueno del evento
+        fot_config = supabase.table("fotografos").select(
+            "logo_url, marca_agua_activa, marca_agua_opacidad"
+        ).eq("id", fotografo_id).execute()
+        cfg = fot_config.data[0] if fot_config.data else {}
+        usar_logo = cfg.get("marca_agua_activa") and cfg.get("logo_url")
+
+        overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+
+        if usar_logo:
+            opacidad_pct = cfg.get("marca_agua_opacidad") or 40
+            alpha = int(255 * (opacidad_pct / 100))
+            try:
+                async with httpx.AsyncClient() as client:
+                    logo_resp = await client.get(cfg["logo_url"], timeout=10)
+                logo_img = Image.open(io.BytesIO(logo_resp.content)).convert("RGBA")
+                # Tamano del logo proporcional al lado mas corto de la foto (se adapta a horizontal/vertical)
+                lado_corto = min(w, h)
+                logo_ancho_objetivo = max(int(lado_corto * 0.22), 60)
+                ratio_logo = logo_ancho_objetivo / logo_img.width
+                logo_img = logo_img.resize((logo_ancho_objetivo, int(logo_img.height * ratio_logo)), Image.LANCZOS)
+                # Aplicar opacidad al canal alpha del logo
+                r, g, b, a = logo_img.split()
+                a = a.point(lambda p: int(p * (alpha / 255)))
+                logo_img.putalpha(a)
+
+                # Patron repetido en diagonal, espaciado proporcional al tamano de la foto
+                paso_x = int(logo_img.width * 2.2)
+                paso_y = int(logo_img.height * 2.2)
+                for row, y in enumerate(range(-paso_y, h + paso_y, paso_y)):
+                    offset_x = (paso_x // 2) if row % 2 else 0
+                    for x in range(-paso_x, w + paso_x, paso_x):
+                        overlay.alpha_composite(logo_img, (x + offset_x, y))
+            except Exception as e:
+                print(f"Error aplicando logo como marca de agua, usando texto: {e}")
+                usar_logo = False
+
+        if not usar_logo:
+            # Marca de agua de texto por defecto
+            draw = ImageDraw.Draw(overlay)
+            texto = "© Kusipix"
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(24, w // 30))
+            except Exception:
+                font = ImageFont.load_default()
+            for y in range(0, h, h // 4 or 1):
+                for x in range(0, w, w // 3 or 1):
+                    draw.text((x, y), texto, fill=(255, 255, 255, 80), font=font)
+
+        img = Image.alpha_composite(img, overlay).convert("RGB")
 
         # Resize preview (max 1200px)
-        max_dim = 1200
-        if w > max_dim or h > max_dim:
-            ratio = min(max_dim / w, max_dim / h)
+        if w > 1200 or h > 1200:
+            ratio = min(1200 / w, 1200 / h)
             img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
 
         # Guardar preview
@@ -1787,6 +1824,56 @@ async def subir_portada_evento(portada: UploadFile = File(...), authorization: O
     supabase.storage.from_("portadas-eventos").upload(path, contenido, {"content-type": portada.content_type})
     url = f"{SUPABASE_URL}/storage/v1/object/public/portadas-eventos/{path}"
     return {"url": url}
+
+
+@app.post("/api/perfil/logo")
+async def subir_logo_fotografo(logo: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+    """Sube el logo del fotografo, lo guarda en logo_url y devuelve la URL publica.
+    Preferir PNG con fondo transparente para mejor resultado como marca de agua."""
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+
+    if not logo.content_type or not logo.content_type.startswith("image/"):
+        return JSONResponse(status_code=400, content={"error": "El archivo debe ser una imagen"})
+
+    contenido = await logo.read()
+    if len(contenido) > 3 * 1024 * 1024:
+        return JSONResponse(status_code=400, content={"error": "El logo no puede superar 3MB"})
+
+    ext = (logo.filename or "png").split(".")[-1].lower()
+    if ext not in ("jpg", "jpeg", "png", "webp"):
+        ext = "png"
+    path = f"{fotografo_id}/logo_{uuid.uuid4().hex}.{ext}"
+
+    supabase.storage.from_("logos-fotografos").upload(path, contenido, {"content-type": logo.content_type})
+    url = f"{SUPABASE_URL}/storage/v1/object/public/logos-fotografos/{path}"
+    supabase.table("fotografos").update({"logo_url": url}).eq("id", fotografo_id).execute()
+    return {"url": url}
+
+
+class ConfigMarcaAguaRequest(BaseModel):
+    marca_agua_activa: bool
+    marca_agua_opacidad: Optional[int] = None
+
+@app.put("/api/perfil/marca-agua")
+async def actualizar_marca_agua(body: ConfigMarcaAguaRequest, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+
+    fot = supabase.table("fotografos").select("logo_url").eq("id", fotografo_id).execute()
+    if body.marca_agua_activa and not (fot.data and fot.data[0].get("logo_url")):
+        return JSONResponse(status_code=400, content={"error": "Debes subir un logo antes de activar la marca de agua"})
+
+    updates = {"marca_agua_activa": body.marca_agua_activa}
+    if body.marca_agua_opacidad is not None:
+        if not (10 <= body.marca_agua_opacidad <= 90):
+            return JSONResponse(status_code=400, content={"error": "La opacidad debe estar entre 10 y 90"})
+        updates["marca_agua_opacidad"] = body.marca_agua_opacidad
+
+    supabase.table("fotografos").update(updates).eq("id", fotografo_id).execute()
+    return {"ok": True}
 
 
 # ─── SUBIDA DIRECTA AL BACKEND ────────────────────────────────────────────────
