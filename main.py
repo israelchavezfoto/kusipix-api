@@ -1449,7 +1449,99 @@ class ActualizarPrecioEventoRequest(BaseModel):
     precio_foto: Optional[int] = None
     precio_todas: Optional[int] = None  # enviar null para desactivar el pack
 
-@app.put("/api/eventos/{evento_id}/precio")
+# ─── PERFIL PUBLICO DEL FOTOGRAFO (subdominio, redes sociales) ──────────────
+
+SUBDOMINIOS_RESERVADOS = {
+    "www", "api", "admin", "app", "mail", "ftp", "blog", "help", "support",
+    "docs", "status", "dev", "staging", "test", "cdn", "static", "assets",
+    "panel", "dashboard", "login", "registro", "kusipix", "root", "email",
+    "smtp", "ns1", "ns2", "webmail", "shop", "store",
+}
+
+class PerfilPublicoRequest(BaseModel):
+    dominio_personalizado: Optional[str] = None  # subdominio, ej "tufoto" (sin .kusipix.com)
+    email_publico: Optional[str] = None
+    instagram: Optional[str] = None
+    facebook: Optional[str] = None
+    tiktok: Optional[str] = None
+
+@app.get("/api/perfil-publico")
+def obtener_perfil_publico(authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+    res = supabase.table("fotografos").select(
+        "dominio_personalizado, email_publico, instagram, facebook, tiktok, logo_url, color_primario, color_secundario"
+    ).eq("id", fotografo_id).execute()
+    if not res.data:
+        return JSONResponse(status_code=404, content={"error": "Fotógrafo no encontrado"})
+    return res.data[0]
+
+@app.put("/api/perfil-publico")
+def actualizar_perfil_publico(body: PerfilPublicoRequest, authorization: Optional[str] = Header(None)):
+    fotografo_id = _fotografo_id_desde_auth(authorization)
+    if not fotografo_id:
+        return JSONResponse(status_code=401, content={"error": "No autorizado"})
+
+    updates = {}
+
+    if body.dominio_personalizado is not None:
+        subdominio = body.dominio_personalizado.strip().lower()
+        if subdominio == "":
+            updates["dominio_personalizado"] = None
+        else:
+            if not (3 <= len(subdominio) <= 30):
+                return JSONResponse(status_code=400, content={"error": "El subdominio debe tener entre 3 y 30 caracteres"})
+            if not all(c.isalnum() or c == "-" for c in subdominio):
+                return JSONResponse(status_code=400, content={"error": "El subdominio solo puede tener letras, números y guiones"})
+            if subdominio.startswith("-") or subdominio.endswith("-"):
+                return JSONResponse(status_code=400, content={"error": "El subdominio no puede empezar ni terminar con guión"})
+            if subdominio in SUBDOMINIOS_RESERVADOS:
+                return JSONResponse(status_code=400, content={"error": "Ese subdominio no está disponible"})
+            existente = supabase.table("fotografos").select("id").eq("dominio_personalizado", subdominio).neq("id", fotografo_id).execute()
+            if existente.data:
+                return JSONResponse(status_code=400, content={"error": "Ese subdominio ya está en uso"})
+            updates["dominio_personalizado"] = subdominio
+
+    if body.email_publico is not None:
+        updates["email_publico"] = body.email_publico.strip() or None
+    if body.instagram is not None:
+        updates["instagram"] = body.instagram.strip() or None
+    if body.facebook is not None:
+        updates["facebook"] = body.facebook.strip() or None
+    if body.tiktok is not None:
+        updates["tiktok"] = body.tiktok.strip() or None
+
+    if not updates:
+        return JSONResponse(status_code=400, content={"error": "No hay cambios para aplicar"})
+
+    try:
+        supabase.table("fotografos").update(updates).eq("id", fotografo_id).execute()
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            return JSONResponse(status_code=400, content={"error": "Ese subdominio ya está en uso"})
+        return JSONResponse(status_code=400, content={"error": "No se pudo guardar el perfil"})
+
+    return {"ok": True}
+
+
+@app.get("/api/fotografo-publico/{subdominio}")
+def obtener_fotografo_por_subdominio(subdominio: str):
+    """Endpoint publico: resuelve un subdominio a los datos del fotografo y sus eventos activos."""
+    fot = supabase.table("fotografos").select(
+        "id, nombre, empresa, logo_url, color_primario, color_secundario, email_publico, instagram, facebook, tiktok"
+    ).eq("dominio_personalizado", subdominio.strip().lower()).execute()
+    if not fot.data:
+        return JSONResponse(status_code=404, content={"error": "No existe un fotógrafo con ese subdominio"})
+    fotografo = fot.data[0]
+
+    eventos = supabase.table("eventos").select(
+        "id, nombre, fecha_evento, ubicacion, slug, portada_url, activo"
+    ).eq("fotografo_id", fotografo["id"]).eq("publico", True).order("fecha_evento", desc=True).execute()
+
+    return {"fotografo": fotografo, "eventos": eventos.data or []}
+
+
 def actualizar_precio_evento(evento_id: str, body: ActualizarPrecioEventoRequest, authorization: Optional[str] = Header(None)):
     fotografo_id = _fotografo_id_desde_auth(authorization)
     if not fotografo_id:
